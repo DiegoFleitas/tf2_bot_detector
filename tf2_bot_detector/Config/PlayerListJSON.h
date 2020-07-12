@@ -1,11 +1,14 @@
 #pragma once
 
+#include "ConfigHelpers.h"
 #include "SteamID.h"
 
+#include <cppcoro/generator.hpp>
 #include <nlohmann/json_fwd.hpp>
 
 #include <chrono>
 #include <filesystem>
+#include <future>
 #include <map>
 #include <optional>
 
@@ -30,6 +33,9 @@ namespace tf2_bot_detector
 		bool HasAttribute(PlayerAttributes attribute) const;
 		bool SetAttribute(PlayerAttributes attribute, bool set = true);
 
+		bool empty() const;
+		PlayerAttributesList& operator|=(const PlayerAttributesList& other);
+
 	private:
 		// For now... just implemented with bools for simplicity
 		bool m_Cheater : 1 = false;
@@ -41,6 +47,7 @@ namespace tf2_bot_detector
 	struct PlayerListData
 	{
 		PlayerListData(const SteamID& id);
+		~PlayerListData();
 
 		SteamID GetSteamID() const { return m_SteamID; }
 
@@ -50,8 +57,12 @@ namespace tf2_bot_detector
 		{
 			std::chrono::system_clock::time_point m_Time;
 			std::string m_PlayerName;
+
+			auto operator<=>(const LastSeen& other) const { return m_Time.time_since_epoch().count() <=> other.m_Time.time_since_epoch().count(); }
 		};
 		std::optional<LastSeen> m_LastSeen;
+
+		std::vector<nlohmann::json> m_Proof;
 
 	private:
 		SteamID m_SteamID;
@@ -85,8 +96,8 @@ namespace tf2_bot_detector
 		bool LoadFiles();
 		void SaveFile() const;
 
-		const PlayerListData* FindPlayerData(const SteamID& id) const;
-		const PlayerAttributesList* FindPlayerAttributes(const SteamID& id) const;
+		cppcoro::generator<const PlayerListData&> FindPlayerData(const SteamID& id) const;
+		cppcoro::generator<const PlayerAttributesList&> FindPlayerAttributes(const SteamID& id) const;
 		bool HasPlayerAttribute(const SteamID& id, PlayerAttributes attribute) const;
 		bool HasPlayerAttribute(const SteamID& id, const std::initializer_list<PlayerAttributes>& attributes) const;
 
@@ -103,19 +114,33 @@ namespace tf2_bot_detector
 		ModifyPlayerResult ModifyPlayer(const SteamID& id, ModifyPlayerAction(*func)(PlayerListData& data, const void* userData),
 			const void* userData = nullptr);
 
+		size_t GetPlayerCount() const { return m_CFGGroup.size(); }
+
 	private:
+		const Settings* m_Settings = nullptr;
+
 		using PlayerMap_t = std::map<SteamID, PlayerListData>;
 
-		bool LoadFile(const std::filesystem::path& filename, PlayerMap_t& map) const;
+		struct PlayerListFile final : public SharedConfigFileBase
+		{
+			void ValidateSchema(const ConfigSchemaInfo& schema) const override;
+			void Deserialize(const nlohmann::json& json) override;
+			void Serialize(nlohmann::json& json) const override;
 
-		bool IsOfficial() const;
-		PlayerMap_t& GetMutableList();
-		const PlayerMap_t* GetMutableList() const;
+			size_t size() const { return m_Players.size(); }
 
-		PlayerMap_t m_OfficialPlayerList;
-		PlayerMap_t m_OtherPlayerLists;
-		std::optional<PlayerMap_t> m_UserPlayerList;
-		const Settings* m_Settings = nullptr;
+			PlayerMap_t m_Players;
+		};
+
+		static constexpr int PLAYERLIST_SCHEMA_VERSION = 3;
+
+		struct ConfigFileGroup final : ConfigFileGroupBase<PlayerListFile, PlayerMap_t>
+		{
+			using ConfigFileGroupBase::ConfigFileGroupBase;
+			void CombineEntries(PlayerMap_t& map, const PlayerListFile& file) const override;
+			std::string GetBaseFileName() const override { return "playerlist"; }
+
+		} m_CFGGroup;
 	};
 
 	void to_json(nlohmann::json& j, const PlayerAttributes& d);

@@ -1,24 +1,26 @@
 #pragma once
 
 #include "CompensatedTS.h"
-#include "IConsoleLineListener.h"
+#include "ConsoleLog/IConsoleLineListener.h"
 #include "IPlayer.h"
 #include "IWorldEventListener.h"
 #include "LobbyMember.h"
 #include "PlayerStatus.h"
+#include "Networking/SteamAPI.h"
 
-#include <mh/coroutine/generator.hpp>
+#include <cppcoro/generator.hpp>
 
 #include <any>
-#include <experimental/coroutine>
-#include <experimental/generator>
 #include <filesystem>
 #include <typeindex>
 #include <unordered_set>
 
 namespace tf2_bot_detector
 {
+	class ChatConsoleLine;
+	class ConsoleLogParser;
 	enum class LobbyMemberTeam : uint8_t;
+	class Settings;
 
 	enum class TeamShareResult
 	{
@@ -27,21 +29,36 @@ namespace tf2_bot_detector
 		Neither,
 	};
 
-	class WorldState : IConsoleLineListener
+	class WorldState;
+
+	class WorldStateConLog
 	{
 	public:
-		WorldState(const std::filesystem::path& conLogFile);
+		void AddConsoleLineListener(IConsoleLineListener* listener);
+		void RemoveConsoleLineListener(IConsoleLineListener* listener);
 
-		void Update();
+		void AddConsoleOutputChunk(const std::string_view& chunk);
+		void AddConsoleOutputLine(const std::string_view& line);
+
+	private:
+		WorldState& GetWorldState();
+
+		std::unordered_set<IConsoleLineListener*> m_ConsoleLineListeners;
+		friend class ConsoleLogParser;
+	};
+
+	class WorldState : IConsoleLineListener, public WorldStateConLog
+	{
+	public:
+		WorldState(const Settings& settings);
+		~WorldState();
+
 		time_point_t GetCurrentTime() const { return m_CurrentTimestamp.GetSnapshot(); }
-		size_t GetParsedLineCount() const { return m_ParsedLineCount; }
-		float GetParseProgress() const { return m_ParseProgress; }
+		void Update();
+		void UpdateTimestamp(const ConsoleLogParser& parser);
 
 		void AddWorldEventListener(IWorldEventListener* listener);
 		void RemoveWorldEventListener(IWorldEventListener* listener);
-
-		void AddConsoleLineListener(IConsoleLineListener* listener);
-		void RemoveConsoleLineListener(IConsoleLineListener* listener);
 
 		std::optional<SteamID> FindSteamIDForName(const std::string_view& playerName) const;
 		std::optional<LobbyMemberTeam> FindLobbyMemberTeam(const SteamID& id) const;
@@ -56,36 +73,33 @@ namespace tf2_bot_detector
 
 		size_t GetApproxLobbyMemberCount() const;
 
-		mh::generator<const IPlayer*> GetLobbyMembers() const;
-		mh::generator<IPlayer*> GetLobbyMembers();
-		mh::generator<const IPlayer*> GetPlayers() const;
-		mh::generator<IPlayer*> GetPlayers();
+		cppcoro::generator<const IPlayer&> GetLobbyMembers() const;
+		cppcoro::generator<IPlayer&> GetLobbyMembers();
+		cppcoro::generator<const IPlayer&> GetPlayers() const;
+		cppcoro::generator<IPlayer&> GetPlayers();
+
+		time_point_t GetLastStatusUpdateTime() const { return m_LastStatusUpdateTime; }
+
+		// Have we joined a team and picked a class?
+		bool IsLocalPlayerInitialized() const { return m_IsLocalPlayerInitialized; }
+		bool IsVoteInProgress() const { return m_IsVoteInProgress; }
 
 	private:
-		struct CustomDeleters
-		{
-			void operator()(FILE*) const;
-		};
-		std::filesystem::path m_FileName;
-		std::unique_ptr<FILE, CustomDeleters> m_File;
-		std::string m_FileLineBuf;
-		size_t m_ParsedLineCount = 0;
-		float m_ParseProgress = 0;
-		std::vector<std::unique_ptr<IConsoleLine>> m_ConsoleLines;
-		std::unordered_set<IConsoleLineListener*> m_ConsoleLineListeners;
-
-		void OnConsoleLineParsed(WorldState& world, IConsoleLine& parsed) override;
+		const Settings* m_Settings = nullptr;
 
 		CompensatedTS m_CurrentTimestamp;
 
+		void OnConsoleLineParsed(WorldState& world, IConsoleLine& parsed) override;
+
 		struct PlayerExtraData final : IPlayer
 		{
-			PlayerExtraData(WorldState& world) : m_World(&world) {}
+			PlayerExtraData(WorldState& world, SteamID id);
 
 			using IPlayer::GetWorld;
 			const WorldState& GetWorld() const override { return *m_World; }
 			const LobbyMember* GetLobbyMember() const override;
-			std::string_view GetName() const override { return m_Status.m_Name; }
+			std::string_view GetNameUnsafe() const override { return m_Status.m_Name; }
+			std::string_view GetNameSafe() const override { return m_PlayerNameSafe; }
 			SteamID GetSteamID() const override { return m_Status.m_SteamID; }
 			PlayerStatusState GetConnectionState() const override { return m_Status.m_State; }
 			std::optional<UserID_t> GetUserID() const override;
@@ -95,33 +109,49 @@ namespace tf2_bot_detector
 			const PlayerScores& GetScores() const override { return m_Scores; }
 			uint16_t GetPing() const override { return m_Status.m_Ping; }
 			time_point_t GetLastStatusUpdateTime() const override { return m_LastStatusUpdateTime; }
+			const SteamAPI::PlayerSummary* GetPlayerSummary() const override { return m_PlayerSummary ? &*m_PlayerSummary : nullptr; }
 
 			WorldState* m_World{};
-			PlayerStatus m_Status{};
 			PlayerScores m_Scores{};
 			TFTeam m_Team{};
 
 			uint8_t m_ClientIndex{};
-			time_point_t m_LastStatusUpdateTime{};
-			time_point_t m_LastPingUpdateTime{};
+			std::optional<SteamAPI::PlayerSummary> m_PlayerSummary;
+
+			void SetStatus(PlayerStatus status, time_point_t timestamp);
+			const PlayerStatus& GetStatus() const { return m_Status; }
+
+			void SetPing(uint16_t ping, time_point_t timestamp);
 
 		protected:
 			std::map<std::type_index, std::any> m_UserData;
 			const std::any* FindDataStorage(const std::type_index& type) const override;
 			std::any& GetOrCreateDataStorage(const std::type_index& type) override;
+
+		private:
+			PlayerStatus m_Status{};
+			std::string m_PlayerNameSafe;
+
+			time_point_t m_LastStatusUpdateTime{};
+			time_point_t m_LastPingUpdateTime{};
 		};
 
 		PlayerExtraData& FindOrCreatePlayer(const SteamID& id);
 
+		std::list<std::future<std::vector<SteamAPI::PlayerSummary>>> m_PlayerSummaryRequests;
+		void QueuePlayerSummaryUpdate();
+		void ApplyPlayerSummaries();
+
 		std::vector<LobbyMember> m_CurrentLobbyMembers;
 		std::vector<LobbyMember> m_PendingLobbyMembers;
 		std::unordered_map<SteamID, PlayerExtraData> m_CurrentPlayerData;
+		bool m_IsLocalPlayerInitialized = false;
+		bool m_IsVoteInProgress = false;
 
 		time_point_t m_LastStatusUpdateTime{};
 
 		struct EventBroadcaster final : IWorldEventListener
 		{
-			void OnUpdate(WorldState& world, bool consoleLinesUpdated) override;
 			void OnTimestampUpdate(WorldState& world) override;
 			void OnPlayerStatusUpdate(WorldState& world, const IPlayer& player) override;
 			void OnChatMsg(WorldState& world, IPlayer& player, const std::string_view& msg) override;

@@ -1,149 +1,79 @@
 #include "WorldState.h"
-#include "Actions.h"
-#include "ConsoleLines.h"
+#include "Actions/Actions.h"
+#include "Config/Settings.h"
+#include "ConsoleLog/ConsoleLines.h"
+#include "ConsoleLog/ConsoleLogParser.h"
+#include "GameData/UserMessageType.h"
 #include "Log.h"
 #include "RegexHelpers.h"
 
-#include <mh/text/string_insertion.hpp>
-
-#include <regex>
+#include <mh/future.hpp>
 
 using namespace std::chrono_literals;
 using namespace std::string_literals;
 using namespace std::string_view_literals;
 using namespace tf2_bot_detector;
 
-WorldState::WorldState(const std::filesystem::path& conLogFile) :
-	m_FileName(conLogFile)
+WorldState::WorldState(const Settings& settings) :
+	m_Settings(&settings)
 {
-	m_ConsoleLineListeners.insert(this);
+	AddConsoleLineListener(this);
+}
+
+WorldState::~WorldState()
+{
+	RemoveConsoleLineListener(this);
 }
 
 void WorldState::Update()
 {
-	if (!m_File)
+	ApplyPlayerSummaries();
+}
+
+void WorldStateConLog::AddConsoleLineListener(IConsoleLineListener* listener)
+{
+	m_ConsoleLineListeners.insert(listener);
+}
+
+void WorldStateConLog::RemoveConsoleLineListener(IConsoleLineListener* listener)
+{
+	m_ConsoleLineListeners.erase(listener);
+}
+
+void WorldStateConLog::AddConsoleOutputChunk(const std::string_view& chunk)
+{
+	size_t last = 0;
+	for (auto i = chunk.find('\n', 0); i != chunk.npos; i = chunk.find('\n', last))
 	{
-		// Try to truncate
-		{
-			std::error_code ec;
-			const auto filesize = std::filesystem::file_size(m_FileName, ec);
-			if (!ec)
-			{
-				std::filesystem::resize_file(m_FileName, 0, ec);
-				if (ec)
-					Log("Unable to truncate console log file, current size is "s << filesize);
-				else
-					Log("Truncated console log file");
-			}
-		}
-
-		{
-			FILE* temp = _fsopen(m_FileName.string().c_str(), "r", _SH_DENYNO);
-			m_File.reset(temp);
-		}
-
-		if (m_File)
-			m_ConsoleLines.clear();
+		auto line = chunk.substr(last, i - last);
+		AddConsoleOutputLine(line);
+		last = i + 1;
 	}
+}
 
-	bool snapshotUpdated = false;
-	const auto TrySnapshot = [&]()
+void WorldStateConLog::AddConsoleOutputLine(const std::string_view& line)
+{
+	auto parsed = IConsoleLine::ParseConsoleLine(line, GetWorldState().GetCurrentTime());
+	if (parsed)
 	{
-		if ((!snapshotUpdated || !m_CurrentTimestamp.IsSnapshotValid()) && m_CurrentTimestamp.IsRecordedValid())
-		{
-			m_CurrentTimestamp.Snapshot();
-			snapshotUpdated = true;
-			m_EventBroadcaster.OnTimestampUpdate(*this);
-		}
-	};
-
-	bool linesProcessed = false;
-	bool consoleLinesUpdated = false;
-	if (m_File)
-	{
-		char buf[4096];
-		size_t readCount;
-		using clock = std::chrono::steady_clock;
-		const auto startTime = clock::now();
-		static const std::regex s_TimestampRegex(R"regex(\n(\d\d)\/(\d\d)\/(\d\d\d\d) - (\d\d):(\d\d):(\d\d):[ \n])regex", std::regex::optimize);
-		do
-		{
-			readCount = fread(buf, sizeof(buf[0]), std::size(buf), m_File.get());
-			if (readCount > 0)
-			{
-				m_FileLineBuf.append(buf, readCount);
-
-				auto regexBegin = m_FileLineBuf.cbegin();
-				std::smatch match;
-				while (std::regex_search(regexBegin, m_FileLineBuf.cend(), match, s_TimestampRegex))
-				{
-					if (m_CurrentTimestamp.IsRecordedValid())
-					{
-						// If we have a valid snapshot, that means that there was a previously parsed
-						// timestamp. The contents of that line is the current timestamp match's prefix
-						// (the previous timestamp match was erased from the string)
-
-						TrySnapshot();
-						linesProcessed = true;
-
-						const auto prefix = match.prefix();
-						//const auto suffix = match.suffix();
-						const std::string_view lineStr(&*prefix.first, prefix.length());
-						auto parsed = IConsoleLine::ParseConsoleLine(lineStr, m_CurrentTimestamp.GetSnapshot());
-
-						if (parsed)
-						{
-							for (auto listener : m_ConsoleLineListeners)
-								listener->OnConsoleLineParsed(*this, *parsed);
-
-							m_ConsoleLines.push_back(std::move(parsed));
-							consoleLinesUpdated = true;
-						}
-						else
-						{
-							for (auto listener : m_ConsoleLineListeners)
-								listener->OnConsoleLineUnparsed(*this, lineStr);
-						}
-					}
-
-					std::tm time{};
-					time.tm_isdst = -1;
-					from_chars_throw(match[1], time.tm_mon);
-					time.tm_mon -= 1;
-
-					from_chars_throw(match[2], time.tm_mday);
-					from_chars_throw(match[3], time.tm_year);
-					time.tm_year -= 1900;
-
-					from_chars_throw(match[4], time.tm_hour);
-					from_chars_throw(match[5], time.tm_min);
-					from_chars_throw(match[6], time.tm_sec);
-
-					m_CurrentTimestamp.SetRecorded(clock_t::from_time_t(std::mktime(&time)));
-					regexBegin = match[0].second;
-				}
-
-				m_ParsedLineCount += std::count(m_FileLineBuf.cbegin(), regexBegin, '\n');
-				m_FileLineBuf.erase(m_FileLineBuf.begin(), regexBegin);
-			}
-
-			if (auto elapsed = clock::now() - startTime; elapsed >= 50ms)
-				break;
-
-		} while (readCount > 0);
-
-		// Parse progress
-		{
-			const auto pos = ftell(m_File.get());
-			const auto length = std::filesystem::file_size(m_FileName);
-			m_ParseProgress = float(double(pos) / length);
-		}
+		for (auto listener : m_ConsoleLineListeners)
+			listener->OnConsoleLineParsed(GetWorldState(), *parsed);
 	}
+	else
+	{
+		for (auto listener : m_ConsoleLineListeners)
+			listener->OnConsoleLineUnparsed(GetWorldState(), line);
+	}
+}
 
-	TrySnapshot();
+WorldState& WorldStateConLog::GetWorldState()
+{
+	return *static_cast<WorldState*>(this);
+}
 
-	if (linesProcessed)
-		m_EventBroadcaster.OnUpdate(*this, consoleLinesUpdated);
+void WorldState::UpdateTimestamp(const ConsoleLogParser& parser)
+{
+	m_CurrentTimestamp = parser.GetCurrentTimestamp();
 }
 
 void WorldState::AddWorldEventListener(IWorldEventListener* listener)
@@ -154,27 +84,6 @@ void WorldState::AddWorldEventListener(IWorldEventListener* listener)
 void WorldState::RemoveWorldEventListener(IWorldEventListener* listener)
 {
 	m_EventBroadcaster.m_EventListeners.erase(listener);
-}
-
-void WorldState::AddConsoleLineListener(IConsoleLineListener* listener)
-{
-	m_ConsoleLineListeners.insert(listener);
-}
-
-void WorldState::RemoveConsoleLineListener(IConsoleLineListener* listener)
-{
-	m_ConsoleLineListeners.erase(listener);
-}
-
-void WorldState::CustomDeleters::operator()(FILE* f) const
-{
-	fclose(f);
-}
-
-void WorldState::EventBroadcaster::OnUpdate(WorldState& world, bool consoleLinesUpdated)
-{
-	for (auto listener : m_EventListeners)
-		listener->OnUpdate(world, consoleLinesUpdated);
 }
 
 void WorldState::EventBroadcaster::OnTimestampUpdate(WorldState& world)
@@ -198,13 +107,19 @@ void WorldState::EventBroadcaster::OnChatMsg(WorldState& world,
 
 std::optional<SteamID> WorldState::FindSteamIDForName(const std::string_view& playerName) const
 {
+	std::optional<SteamID> retVal;
+	time_point_t lastUpdated{};
+
 	for (const auto& data : m_CurrentPlayerData)
 	{
-		if (data.second.m_Status.m_Name == playerName)
-			return data.first;
+		if (data.second.GetStatus().m_Name == playerName && data.second.GetLastStatusUpdateTime() > lastUpdated)
+		{
+			retVal = data.second.GetSteamID();
+			lastUpdated = data.second.GetLastStatusUpdateTime();
+		}
 	}
 
-	return std::nullopt;
+	return retVal;
 }
 
 std::optional<LobbyMemberTeam> WorldState::FindLobbyMemberTeam(const SteamID& id) const
@@ -224,12 +139,12 @@ std::optional<LobbyMemberTeam> WorldState::FindLobbyMemberTeam(const SteamID& id
 	return std::nullopt;
 }
 
-std::optional<uint16_t> WorldState::FindUserID(const SteamID& id) const
+std::optional<UserID_t> WorldState::FindUserID(const SteamID& id) const
 {
 	for (const auto& player : m_CurrentPlayerData)
 	{
-		if (player.second.m_Status.m_SteamID == id)
-			return player.second.m_Status.m_UserID;
+		if (player.second.GetSteamID() == id)
+			return player.second.GetUserID();
 	}
 
 	return std::nullopt;
@@ -275,7 +190,7 @@ size_t WorldState::GetApproxLobbyMemberCount() const
 	return m_CurrentLobbyMembers.size() + m_PendingLobbyMembers.size();
 }
 
-mh::generator<const IPlayer*> WorldState::GetLobbyMembers() const
+cppcoro::generator<const IPlayer&> WorldState::GetLobbyMembers() const
 {
 	const auto GetPlayer = [&](const LobbyMember& member) -> const IPlayer*
 	{
@@ -299,7 +214,8 @@ mh::generator<const IPlayer*> WorldState::GetLobbyMembers() const
 		if (!member.IsValid())
 			continue;
 
-		co_yield GetPlayer(member);
+		if (auto found = GetPlayer(member))
+			co_yield *found;
 	}
 	for (const auto& member : m_PendingLobbyMembers)
 	{
@@ -312,26 +228,28 @@ mh::generator<const IPlayer*> WorldState::GetLobbyMembers() const
 			// Don't return two different instances with the same steamid.
 			continue;
 		}
-		co_yield GetPlayer(member);
+
+		if (auto found = GetPlayer(member))
+			co_yield *found;
 	}
 }
 
-mh::generator<IPlayer*> WorldState::GetLobbyMembers()
+cppcoro::generator<IPlayer&> WorldState::GetLobbyMembers()
 {
-	for (const IPlayer* member : std::as_const(*this).GetLobbyMembers())
-		co_yield const_cast<IPlayer*>(member);
+	for (const IPlayer& member : std::as_const(*this).GetLobbyMembers())
+		co_yield const_cast<IPlayer&>(member);
 }
 
-mh::generator<const IPlayer*> WorldState::GetPlayers() const
+cppcoro::generator<const IPlayer&> WorldState::GetPlayers() const
 {
 	for (const auto& pair : m_CurrentPlayerData)
-		co_yield &pair.second;
+		co_yield pair.second;
 }
 
-mh::generator<IPlayer*> WorldState::GetPlayers()
+cppcoro::generator<IPlayer&> WorldState::GetPlayers()
 {
-	for (const IPlayer* player : std::as_const(*this).GetPlayers())
-		co_yield const_cast<IPlayer*>(player);
+	for (const IPlayer& player : std::as_const(*this).GetPlayers())
+		co_yield const_cast<IPlayer&>(player);
 }
 
 void WorldState::OnConsoleLineParsed(WorldState& world, IConsoleLine& parsed)
@@ -354,6 +272,16 @@ void WorldState::OnConsoleLineParsed(WorldState& world, IConsoleLine& parsed)
 		m_PendingLobbyMembers.resize(headerLine.GetPendingCount());
 		break;
 	}
+	case ConsoleLineType::LobbyStatusFailed:
+	{
+		if (!m_CurrentLobbyMembers.empty() || !m_PendingLobbyMembers.empty())
+		{
+			m_CurrentLobbyMembers.clear();
+			m_PendingLobbyMembers.clear();
+			m_CurrentPlayerData.clear();
+		}
+		break;
+	}
 	case ConsoleLineType::LobbyChanged:
 	{
 		auto& lobbyChangedLine = static_cast<const LobbyChangedLine&>(parsed);
@@ -369,6 +297,8 @@ void WorldState::OnConsoleLineParsed(WorldState& world, IConsoleLine& parsed)
 			// We can't trust the existing client indices
 			for (auto& player : m_CurrentPlayerData)
 				player.second.m_ClientIndex = 0;
+
+			QueuePlayerSummaryUpdate();
 		}
 		break;
 	}
@@ -376,6 +306,9 @@ void WorldState::OnConsoleLineParsed(WorldState& world, IConsoleLine& parsed)
 	{
 		// Reset current lobby members/player statuses
 		//ClearLobbyState();
+		m_IsLocalPlayerInitialized = false;
+		m_IsVoteInProgress = false;
+		DebugLogWarning("Client reached server spawn");
 		break;
 	}
 	case ConsoleLineType::Chat:
@@ -389,18 +322,34 @@ void WorldState::OnConsoleLineParsed(WorldState& world, IConsoleLine& parsed)
 			}
 			else
 			{
-#ifdef _DEBUG
-				Log("Dropped chat message with unknown IPlayer from "s
+				LogWarning("Dropped chat message with unknown IPlayer from "s
 					<< std::quoted(chatLine.GetPlayerName()) << ": " << std::quoted(chatLine.GetMessage()));
-#endif
 			}
 		}
 		else
 		{
-#ifdef _DEBUG
-			Log("Dropped chat message with unknown SteamID from "s
+			LogWarning("Dropped chat message with unknown SteamID from "s
 				<< std::quoted(chatLine.GetPlayerName()) << ": " << std::quoted(chatLine.GetMessage()));
-#endif
+		}
+
+		break;
+	}
+	case ConsoleLineType::ConfigExec:
+	{
+		auto& execLine = static_cast<const ConfigExecLine&>(parsed);
+		const std::string_view& cfgName = execLine.GetConfigFileName();
+		if (cfgName == "scout.cfg"sv ||
+			cfgName == "sniper.cfg"sv ||
+			cfgName == "soldier.cfg"sv ||
+			cfgName == "demoman.cfg"sv ||
+			cfgName == "medic.cfg"sv ||
+			cfgName == "heavyweapons.cfg"sv ||
+			cfgName == "pyro.cfg"sv ||
+			cfgName == "spy.cfg"sv ||
+			cfgName == "engineer.cfg"sv)
+		{
+			DebugLog("Spawned as "s << cfgName.substr(0, cfgName.size() - 3));
+			m_IsLocalPlayerInitialized = true;
 		}
 
 		break;
@@ -447,8 +396,7 @@ void WorldState::OnConsoleLineParsed(WorldState& world, IConsoleLine& parsed)
 		if (auto found = FindSteamIDForName(pingLine.GetPlayerName()))
 		{
 			auto& playerData = FindOrCreatePlayer(*found);
-			playerData.m_Status.m_Ping = pingLine.GetPing();
-			playerData.m_LastPingUpdateTime = pingLine.GetTimestamp();
+			playerData.SetPing(pingLine.GetPing(), pingLine.GetTimestamp());
 		}
 
 		break;
@@ -460,16 +408,15 @@ void WorldState::OnConsoleLineParsed(WorldState& world, IConsoleLine& parsed)
 		auto& playerData = FindOrCreatePlayer(newStatus.m_SteamID);
 
 		// Don't introduce stutter to our connection time view
-		if (auto delta = (playerData.m_Status.m_ConnectionTime - newStatus.m_ConnectionTime);
+		if (auto delta = (playerData.GetStatus().m_ConnectionTime - newStatus.m_ConnectionTime);
 			delta < 2s && delta > -2s)
 		{
-			newStatus.m_ConnectionTime = playerData.m_Status.m_ConnectionTime;
+			newStatus.m_ConnectionTime = playerData.GetStatus().m_ConnectionTime;
 		}
 
-		assert(playerData.m_Status.m_SteamID == newStatus.m_SteamID);
-		playerData.m_Status = newStatus;
-		playerData.m_LastStatusUpdateTime = playerData.m_LastPingUpdateTime = statusLine.GetTimestamp();
-		m_LastStatusUpdateTime = std::max(m_LastStatusUpdateTime, playerData.m_LastStatusUpdateTime);
+		assert(playerData.GetStatus().m_SteamID == newStatus.m_SteamID);
+		playerData.SetStatus(newStatus, statusLine.GetTimestamp());
+		m_LastStatusUpdateTime = std::max(m_LastStatusUpdateTime, playerData.GetLastStatusUpdateTime());
 		m_EventBroadcaster.OnPlayerStatusUpdate(*this, playerData);
 
 		break;
@@ -486,11 +433,43 @@ void WorldState::OnConsoleLineParsed(WorldState& world, IConsoleLine& parsed)
 	case ConsoleLineType::KillNotification:
 	{
 		auto& killLine = static_cast<const KillNotificationLine&>(parsed);
+		const auto localSteamID = m_Settings->GetLocalSteamID();
+		const auto attackerSteamID = FindSteamIDForName(killLine.GetAttackerName());
+		const auto victimSteamID = FindSteamIDForName(killLine.GetVictimName());
 
-		if (const auto attackerSteamID = FindSteamIDForName(killLine.GetAttackerName()))
-			FindOrCreatePlayer(*attackerSteamID).m_Scores.m_Kills++;
-		if (const auto victimSteamID = FindSteamIDForName(killLine.GetVictimName()))
-			FindOrCreatePlayer(*victimSteamID).m_Scores.m_Deaths++;
+		if (attackerSteamID)
+		{
+			auto& attacker = FindOrCreatePlayer(*attackerSteamID);
+			attacker.m_Scores.m_Kills++;
+
+			if (victimSteamID == localSteamID)
+				attacker.m_Scores.m_LocalKills++;
+		}
+
+		if (victimSteamID)
+		{
+			auto& victim = FindOrCreatePlayer(*victimSteamID);
+			victim.m_Scores.m_Deaths++;
+
+			if (attackerSteamID == localSteamID)
+				victim.m_Scores.m_LocalDeaths++;
+		}
+
+		break;
+	}
+	case ConsoleLineType::SVC_UserMessage:
+	{
+		auto& userMsg = static_cast<const SVCUserMessageLine&>(parsed);
+		switch (userMsg.GetUserMessageType())
+		{
+		case UserMessageType::VoteStart:
+			m_IsVoteInProgress = true;
+			break;
+		case UserMessageType::VoteFailed:
+		case UserMessageType::VotePass:
+			m_IsVoteInProgress = false;
+			break;
+		}
 
 		break;
 	}
@@ -538,18 +517,71 @@ auto WorldState::FindOrCreatePlayer(const SteamID& id) -> PlayerExtraData&
 	if (auto found = m_CurrentPlayerData.find(id); found != m_CurrentPlayerData.end())
 		data = &found->second;
 	else
-		data = &m_CurrentPlayerData.emplace(id, *this).first->second;
+		data = &m_CurrentPlayerData.emplace(id, PlayerExtraData{ *this, id }).first->second;
 
-	assert(!data->m_Status.m_SteamID.IsValid() || data->m_Status.m_SteamID == id);
-	data->m_Status.m_SteamID = id;
 	assert(data->GetSteamID() == id);
-
 	return *data;
+}
+
+void WorldState::QueuePlayerSummaryUpdate()
+{
+	auto client = m_Settings->GetHTTPClient();
+	if (!client)
+		return;
+
+	if (m_Settings->m_SteamAPIKey.empty())
+		return;
+
+	std::vector<SteamID> steamIDs;
+
+	for (const IPlayer& member : GetLobbyMembers())
+		steamIDs.push_back(member.GetSteamID());
+
+	auto summary = SteamAPI::GetPlayerSummariesAsync(m_Settings->m_SteamAPIKey, std::move(steamIDs), *client);
+	if (summary.valid())
+		m_PlayerSummaryRequests.push_back(std::move(summary));
+}
+
+void WorldState::ApplyPlayerSummaries()
+{
+	for (auto it = m_PlayerSummaryRequests.begin(); it != m_PlayerSummaryRequests.end(); )
+	{
+		if (!mh::is_future_ready(*it))
+		{
+			++it;
+			break;
+		}
+
+		auto summaryReqFuture = std::move(*it);
+		it = m_PlayerSummaryRequests.erase(it);
+
+		try
+		{
+			auto summaryReq = summaryReqFuture.get();
+			for (SteamAPI::PlayerSummary& entry : summaryReq)
+			{
+				const auto steamID = entry.m_SteamID;
+				FindOrCreatePlayer(steamID).m_PlayerSummary = std::move(entry);
+			}
+
+			DebugLog("Applied "s << summaryReq.size() << " player summaries from Steam web API");
+		}
+		catch (const std::exception& e)
+		{
+			LogError("Failed to apply player summaries from Steam web API: "s << e.what());
+		}
+	}
 }
 
 auto WorldState::GetTeamShareResult(const SteamID& id0, const SteamID& id1) const -> TeamShareResult
 {
 	return GetTeamShareResult(FindLobbyMemberTeam(id0), FindLobbyMemberTeam(id1));
+}
+
+WorldState::PlayerExtraData::PlayerExtraData(WorldState& world, SteamID id) :
+	m_World(&world)
+{
+	m_Status.m_SteamID = id;
 }
 
 const LobbyMember* WorldState::PlayerExtraData::GetLobbyMember() const
@@ -581,9 +613,21 @@ std::optional<UserID_t> WorldState::PlayerExtraData::GetUserID() const
 duration_t WorldState::PlayerExtraData::GetConnectedTime() const
 {
 	auto result = GetWorld().GetCurrentTime() - GetConnectionTime();
-	assert(result >= -1s);
+	//assert(result >= -1s);
 	result = std::max<duration_t>(result, 0s);
 	return result;
+}
+
+void WorldState::PlayerExtraData::SetStatus(PlayerStatus status, time_point_t timestamp)
+{
+	m_Status = std::move(status);
+	m_PlayerNameSafe = CollapseNewlines(m_Status.m_Name);
+	m_LastStatusUpdateTime = m_LastPingUpdateTime = timestamp;
+}
+void WorldState::PlayerExtraData::SetPing(uint16_t ping, time_point_t timestamp)
+{
+	m_Status.m_Ping = ping;
+	m_LastPingUpdateTime = timestamp;
 }
 
 const std::any* WorldState::PlayerExtraData::FindDataStorage(const std::type_index& type) const

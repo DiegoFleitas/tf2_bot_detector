@@ -1,0 +1,210 @@
+{
+	"$schema": "http://json-schema.org/draft-07/schema#",
+	"$id": "https://raw.githubusercontent.com/PazerOP/tf2_bot_detector/master/schemas/v3/settings.schema.json",
+	"title": "TF2 Bot Detector Settings Schema",
+	"type": "object",
+	"additionalProperties": false,
+	"properties": {
+		"$schema": {
+			"description": "The JSON schema to validate this file against.",
+			"type": "string"
+		},
+		"general": {
+			"type": "object",
+			"description": "General settings.",
+			"additionalProperties": false,
+			"properties": {
+				"auto_temp_mute": {
+					"description": "Automatically, temporarily mute ingame chat messages if we think someone else in the server is running the tool.",
+					"type": "boolean"
+				},
+				"auto_launch_tf2": {
+					"description": "Controls whether TF2 will automatically be launched when TF2BD is opened.",
+					"type": "boolean"
+				},
+				"local_steamid_override": {
+					"description": "The SteamID of the player running the tool. Overrides the auto-detected value.",
+					"$ref": "./shared.schema.json#definitions/steamid"
+				},
+				"tf_game_dir_override": {
+					"description": "The local tf directory. Overrides the auto-detected value.",
+					"type": "string"
+				},
+				"steam_dir_override": {
+					"description": "The local installation directory of Steam. Overrides the auto-detected value.",
+					"type": "string"
+				},
+				"steam_api_key": {
+					"description": "The user's Steam Web API key from https://steamcommunity.com/dev/apikey.",
+					"type": "string"
+				},
+				"sleep_when_unfocused": {
+					"description": "If true, the tool reduces its update rate when not focused to reduce CPU/GPU usage.",
+					"type": "boolean"
+				},
+				"allow_internet_usage": {
+					"description": "Allow this program to connect to the internet.",
+					"type": "boolean",
+					"default": true
+				},
+				"command_timeout_seconds": {
+					"description": "Seconds before terminating -hijack processes.",
+					"type":"number",
+					"default": 5
+				},
+				"program_update_check_mode": {
+					"description": "Automatically connect to the internet and check for updates via Github. Does nothing if allow_internet_usage is false.",
+					"oneOf": [
+						{
+							"const": "releases",
+							"description": "Automatically check for updates and prompt the user if a new release is available."
+						},
+						{
+							"const": "previews",
+							"description": "Automatically check for updates and prompt the user if a new release OR preview is available."
+						},
+						{
+							"const": "disabled",
+							"description": "Disable auto-update completely. You can still check for updates manually through the Help menu."
+						}
+					],
+					"default": "releases"
+				}
+			}
+		},
+		"theme": {
+			"type": "object",
+			"additionalProperties": false,
+			"properties": {
+				"colors": {
+					"type": "object",
+					"additionalProperties": false,
+					"properties": {
+						"scoreboard_racism": {
+							"$ref": "./shared.schema.json#definitions/color",
+							"description": "Color to flash rows on the scoreboard for players marked as racist.",
+							"default": [
+								1.0,
+								1.0,
+								1.0,
+								1.0
+							]
+						},
+						"scoreboard_cheater": {
+							"$ref": "./shared.schema.json#definitions/color",
+							"description": "Color to flash rows on the scoreboard for players marked as cheaters.",
+							"default": [
+								1.0,
+								0.0,
+								1.0,
+								1.0
+							]
+						},
+						"scoreboard_suspicious": {
+							"$ref": "./shared.schema.json#definitions/color",
+							"description": "Color to flash rows on the scoreboard for players marked as racist.",
+							"default": [
+								1.0,
+								1.0,
+								0.0,
+								1.0
+							]
+						},
+						"scoreboard_exploiter": {
+							"$ref": "./shared.schema.json#definitions/color",
+							"description": "Color to flash rows on the scoreboard for players marked as racist.",
+							"default": [
+								0.0,
+								1.0,
+								1.0,
+								1.0
+							]
+						},
+						"scoreboard_you": {
+							"$ref": "./shared.schema.json#definitions/color",
+							"description": "Color to highlight your SteamID on the scoreboard.",
+							"default": [
+								0.0,
+								1.0,
+								0.0,
+								1.0
+							]
+						},
+						"scoreboard_connecting": {
+							"$ref": "./shared.schema.json#definitions/color",
+							"description": "Color to highlight connecting players on the scoreboard.",
+							"default": [
+								1.0,
+								1.0,
+								0.0,
+								0.5
+							]
+						},
+						"friendly_team": {
+							"$ref": "./shared.schema.json#definitions/color",
+							"description": "Color to use for your team.",
+							"default": [
+								0.19704340398311615,
+								0.5180000066757202,
+								0.25745877623558044,
+								0.5
+							]
+						},
+						"enemy_team": {
+							"$ref": "./shared.schema.json#definitions/color",
+							"description": "Color to use for the enemy team.",
+							"default": [
+								0.8270000219345093,
+								0.42039787769317627,
+								0.38951700925827026,
+								0.5
+							]
+						}
+					},
+					"required": [
+						"scoreboard_racism",
+						"scoreboard_cheater",
+						"scoreboard_suspicious",
+						"scoreboard_exploiter",
+						"scoreboard_you",
+						"scoreboard_connecting",
+						"friendly_team",
+						"enemy_team"
+					]
+				}
+			},
+			"required": [
+				"colors"
+			]
+		},
+		"goto_profile_sites": {
+			"type": "array",
+			"description": "General settings.",
+			"additionalProperties": false,
+			"items": {
+				"type": "object",
+				"description": "A site that appears in the \"Go To\" menu when right clicking on a user.",
+				"additionalProperties": false,
+				"properties": {
+					"name": {
+						"type": "string",
+						"description": "Name of this site (shows in menu)."
+					},
+					"profile_url": {
+						"type": "string",
+						"description": "URL for visiting profiles. Allows you to specify replacements like https://steamcommunity.com/id/%SteamID64%. Valid replacements are %SteamID64%, or %SteamID3% for [U:1:XXXXXX]."
+					}
+				},
+				"required": [
+					"name",
+					"profile_url"
+				]
+			}
+		}
+	},
+	"required": [
+		"general",
+		"theme"
+	],
+	"definitions": {}
+}

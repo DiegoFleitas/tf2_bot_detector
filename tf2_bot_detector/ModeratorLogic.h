@@ -1,6 +1,6 @@
 #pragma once
 
-#include "IConsoleLineListener.h"
+#include "ConsoleLog/IConsoleLineListener.h"
 #include "IWorldEventListener.h"
 #include "Config/PlayerListJSON.h"
 #include "Config/Rules.h"
@@ -11,7 +11,7 @@
 
 namespace tf2_bot_detector
 {
-	class ActionManager;
+	class RCONActionManager;
 	enum class LobbyMemberTeam : uint8_t;
 	class IPlayer;
 	enum class KickReason;
@@ -24,7 +24,9 @@ namespace tf2_bot_detector
 	class ModeratorLogic final : IConsoleLineListener, BaseWorldEventListener
 	{
 	public:
-		ModeratorLogic(WorldState& world, const Settings& settings, ActionManager& actionManager);
+		ModeratorLogic(WorldState& world, const Settings& settings, RCONActionManager& actionManager);
+
+		void Update();
 
 		bool InitiateVotekick(const IPlayer& id, KickReason reason);
 
@@ -46,10 +48,15 @@ namespace tf2_bot_detector
 		bool IsUserRunningTool(const SteamID& id) const;
 		void SetUserRunningTool(const SteamID& id, bool isRunningTool = true);
 
+		size_t GetBlacklistedPlayerCount() const { return m_PlayerList.GetPlayerCount(); }
+		size_t GetRuleCount() const { return m_Rules.GetRuleCount(); }
+
+		void ReloadConfigFiles();
+
 	private:
 		WorldState* m_World = nullptr;
 		const Settings* m_Settings = nullptr;
-		ActionManager* m_ActionManager = nullptr;
+		RCONActionManager* m_ActionManager = nullptr;
 
 		struct PlayerExtraData
 		{
@@ -72,7 +79,6 @@ namespace tf2_bot_detector
 		// Steam IDs of players that we think are running the tool.
 		std::unordered_set<SteamID> m_PlayersRunningTool;
 
-		void OnUpdate(WorldState& world, bool consoleLinesUpdated) override;
 		void OnPlayerStatusUpdate(WorldState& world, const IPlayer& player) override;
 		void OnChatMsg(WorldState& world, IPlayer& player, const std::string_view& msg) override;
 
@@ -101,13 +107,14 @@ namespace tf2_bot_detector
 		time_point_t m_NextCheaterWarningTime{};            // The soonest we can warn about connected cheaters on the other team
 		time_point_t m_LastPlayerActionsUpdate{};
 		void ProcessPlayerActions();
-		void HandleFriendlyCheaters(uint8_t friendlyPlayerCount, const std::vector<const IPlayer*>& friendlyCheaters);
+		void HandleFriendlyCheaters(uint8_t friendlyPlayerCount, uint8_t connectedFriendlyPlayerCount,
+			const std::vector<const IPlayer*>& friendlyCheaters);
 		void HandleEnemyCheaters(uint8_t enemyPlayerCount, const std::vector<IPlayer*>& enemyCheaters,
 			const std::vector<IPlayer*>& connectingEnemyCheaters);
 		void HandleConnectedEnemyCheaters(const std::vector<IPlayer*>& enemyCheaters);
 		void HandleConnectingEnemyCheaters(const std::vector<IPlayer*>& connectingEnemyCheaters);
 
-		ModerationRules m_Rules;
 		PlayerListJSON m_PlayerList;
+		ModerationRules m_Rules;
 	};
 }

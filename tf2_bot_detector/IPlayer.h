@@ -2,6 +2,7 @@
 
 #include "Clock.h"
 #include "SteamID.h"
+#include "TextUtils.h"
 #include "TFConstants.h"
 
 #include <any>
@@ -17,10 +18,17 @@ namespace tf2_bot_detector
 	enum class TFTeam : uint8_t;
 	class WorldState;
 
+	namespace SteamAPI
+	{
+		struct PlayerSummary;
+	}
+
 	struct PlayerScores
 	{
 		uint16_t m_Kills = 0;
 		uint16_t m_Deaths = 0;
+		uint16_t m_LocalKills = 0;
+		uint16_t m_LocalDeaths = 0;
 	};
 
 	class IPlayer
@@ -33,8 +41,14 @@ namespace tf2_bot_detector
 
 		virtual const LobbyMember* GetLobbyMember() const = 0;
 
-		virtual std::string_view GetName() const = 0;
+		// Player name exactly as it is ingame, no evil characters collapsed/removed
+		virtual std::string_view GetNameUnsafe() const = 0;
+
+		// Player name with evil characters collapsed/removed
+		virtual std::string_view GetNameSafe() const = 0;
+
 		virtual SteamID GetSteamID() const = 0;
+		virtual const SteamAPI::PlayerSummary* GetPlayerSummary() const = 0;
 		virtual std::optional<UserID_t> GetUserID() const = 0;
 
 		virtual PlayerStatusState GetConnectionState() const = 0;
@@ -62,23 +76,6 @@ namespace tf2_bot_detector
 			else
 				return std::any_cast<T&>(storage);
 		}
-#if 0
-		template<typename T> const T* GetPlayerData(const SteamID& id) const
-		{
-			if (auto foundPlayer = m_CurrentPlayerData.find(id); foundPlayer != m_CurrentPlayerData.end())
-			{
-				if (auto foundData = foundPlayer->second.m_UserData.find(typeid(T)); foundData != foundPlayer->second.m_UserData.end())
-					return &std::any_cast<T>(foundData->second);
-			}
-
-			return nullptr;
-		}
-		template<typename T> bool SetPlayerData(const SteamID& id, T&& value)
-		{
-			if (auto foundPlayer = m_CurrentPlayerData.find(id); foundPlayer != m_CurrentPlayerData.end())
-				foundPlayer->second.m_UserData[typeid(T)] = std::move(value);
-		}
-#else
 		template<typename T> inline const T* GetData() const
 		{
 			return std::any_cast<T>(FindDataStorage(typeid(T)));
@@ -87,7 +84,6 @@ namespace tf2_bot_detector
 		{
 			GetOrCreateDataStorage(typeid(T)) = std::move(value);
 		}
-#endif
 
 		virtual std::any& GetOrCreateDataStorage(const std::type_index& type) = 0;
 
@@ -103,7 +99,7 @@ namespace tf2_bot_detector
 template<typename CharT, typename Traits>
 std::basic_ostream<CharT, Traits>& operator<<(std::basic_ostream<CharT, Traits>& os, const tf2_bot_detector::IPlayer& player)
 {
-	return os << '"' << player.GetName() << "\" (" << player.GetSteamID() << ')';
+	return os << '"' << player.GetNameSafe() << "\" " << player.GetSteamID();
 }
 
 template<typename CharT, typename Traits>

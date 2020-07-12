@@ -48,7 +48,8 @@ namespace tf2_bot_detector
 		constexpr SteamID() = default;
 		explicit SteamID(const std::string_view& str);
 		explicit constexpr SteamID(uint64_t id64) : ID64(id64) {}
-		explicit constexpr SteamID(uint32_t id, SteamAccountInstance instance, SteamAccountType type, SteamAccountUniverse universe) :
+		explicit constexpr SteamID(uint32_t id, SteamAccountType type, SteamAccountUniverse universe,
+			SteamAccountInstance instance = SteamAccountInstance::Desktop) :
 			ID(id), Instance(instance), Type(type), Universe(universe)
 		{
 		}
@@ -61,7 +62,12 @@ namespace tf2_bot_detector
 			return *this == SteamID(76561198003911389);
 		}
 
-		constexpr bool IsValid() const { return Type != SteamAccountType::Invalid && Universe != SteamAccountUniverse::Invalid; }
+		constexpr bool IsValid() const
+		{
+			return Type != SteamAccountType::Invalid &&
+				Universe != SteamAccountUniverse::Invalid &&
+				ID != 0;
+		}
 		std::string str() const;
 
 		union

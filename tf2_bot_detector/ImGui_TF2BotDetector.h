@@ -1,11 +1,12 @@
 #pragma once
 
 #include <imgui_desktop/ImGuiHelpers.h>
+#include <imgui_desktop/ScopeGuards.h>
 #include <imgui.h>
 #include <misc/cpp/imgui_stdlib.h>
-#include <implot.h>
 
 #include <filesystem>
+#include <optional>
 #include <string_view>
 #include <type_traits>
 
@@ -103,13 +104,58 @@ namespace ImGui
 
 	void Value(const char* prefix, double v, const char* float_format = nullptr);
 	void Value(const char* prefix, const char* str);
+	void Value(const char* prefix, uint64_t v);
+
+	void SetHoverTooltip(const char* tooltipFmt, ...);
+
+	template<typename TFunc>
+	inline void EnabledSwitch(bool enabled, TFunc&& func, const char* disabledTooltip = nullptr)
+	{
+		if (enabled)
+		{
+			if constexpr (std::is_invocable_v<TFunc, bool>)
+				func(true);
+			else
+				func();
+		}
+		else
+		{
+			ImGui::BeginGroup();
+			{
+				ImGuiDesktop::ScopeGuards::GlobalAlpha globalAlpha(0.65f);
+				ImGui::PushItemFlag(ImGuiItemFlags_Disabled, true);
+
+
+				if constexpr (std::is_invocable_v<TFunc, bool>)
+					func(false);
+				else
+					func();
+
+				ImGui::PopItemFlag();
+			}
+			ImGui::EndGroup();
+
+			if (disabledTooltip)
+			{
+				ImGuiDesktop::ScopeGuards::GlobalAlpha tooltipAlpha(1);
+				ImGui::SetHoverTooltip("%s", disabledTooltip);
+			}
+		}
+	}
 }
 
 namespace tf2_bot_detector
 {
+	enum class ProgramUpdateCheckMode;
 	class SteamID;
-	bool InputTextSteamID(const char* label_id, SteamID& steamID, bool requireValid = true);
-	bool InputTextTFDir(const std::string_view& label_id, std::filesystem::path& path, bool requireValid = false);
+
+	bool InputTextSteamIDOverride(const char* label_id, SteamID& steamID, bool requireValid = true);
+	bool InputTextTFDirOverride(const std::string_view& label_id, std::filesystem::path& path,
+		const std::filesystem::path& autodetectedPath, bool requireValid = false);
+	bool InputTextSteamDirOverride(const std::string_view& label_id, std::filesystem::path& path, bool requireValid = false);
+	bool InputTextLocalIPOverride(const std::string_view& label_id, std::string& ip, bool requireValid = false);
+	bool Combo(const char* label_id, ProgramUpdateCheckMode& mode);
+	bool AutoLaunchTF2Checkbox(bool& value);
 }
 
 namespace ImPlot

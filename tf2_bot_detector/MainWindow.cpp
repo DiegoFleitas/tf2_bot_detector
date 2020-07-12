@@ -1,19 +1,22 @@
 #include "MainWindow.h"
-#include "ConsoleLines.h"
-#include "NetworkStatus.h"
+#include "ConsoleLog/ConsoleLines.h"
+#include "Networking/GithubAPI.h"
+#include "ConsoleLog/NetworkStatus.h"
 #include "RegexHelpers.h"
+#include "Platform/Platform.h"
 #include "ImGui_TF2BotDetector.h"
-#include "PeriodicActions.h"
+#include "Actions/ActionGenerators.h"
 #include "Log.h"
 #include "PathUtils.h"
+#include "Version.h"
 
 #include <imgui_desktop/ScopeGuards.h>
 #include <imgui_desktop/ImGuiHelpers.h>
 #include <imgui.h>
 #include <misc/cpp/imgui_stdlib.h>
-#include <implot.h>
 #include <mh/math/interpolation.hpp>
 #include <mh/text/case_insensitive_string.hpp>
+#include <mh/text/stringops.hpp>
 
 #include <cassert>
 #include <chrono>
@@ -26,37 +29,39 @@ using namespace std::string_literals;
 using namespace std::string_view_literals;
 
 MainWindow::MainWindow() :
-	ImGuiDesktop::Window(800, 600, "TF2 Bot Detector"),
-	m_ActionManager(m_Settings)
+	ImGuiDesktop::Window(800, 600, ("TF2 Bot Detector v"s << VERSION).c_str())
 {
+	m_WorldState.AddConsoleLineListener(this);
+	m_WorldState.AddWorldEventListener(this);
+
+	DebugLog("Debug Info:"s
+		<< "\n\tSteam dir:         " << m_Settings.GetSteamDir()
+		<< "\n\tTF dir:            " << m_Settings.GetTFDir()
+		<< "\n\tSteamID:           " << m_Settings.GetLocalSteamID()
+		<< "\n\tVersion:           " << VERSION
+		<< "\n\tIs CI Build:       " << std::boolalpha << (TF2BD_IS_CI_COMPILE ? true : false)
+		<< "\n\tCompile Timestamp: " << __TIMESTAMP__
+#ifdef _MSC_FULL_VER
+		<< "\n\t-D _MSC_FULL_VER:  " << _MSC_FULL_VER
+#endif
+#if _M_X64
+		<< "\n\t-D _M_X64:         " << _M_X64
+#endif
+#if _MT
+		<< "\n\t-D _MT:            " << _MT
+#endif
+	);
+
 	m_OpenTime = clock_t::now();
 
-	m_ActionManager.AddPeriodicAction<StatusUpdateAction>();
-	m_ActionManager.AddPeriodicAction<ConfigAction>();
+	m_ActionManager.AddPeriodicActionGenerator<StatusUpdateActionGenerator>();
+	m_ActionManager.AddPeriodicActionGenerator<ConfigActionGenerator>();
+	m_ActionManager.AddPeriodicActionGenerator<LobbyDebugActionGenerator>();
 	//m_ActionManager.AddPiggybackAction<GenericCommandAction>("net_status");
 }
 
 MainWindow::~MainWindow()
 {
-}
-
-static float GetRemainingColumnWidth(float contentRegionWidth, int column_index = -1)
-{
-	const auto origContentWidth = contentRegionWidth;
-
-	if (column_index == -1)
-		column_index = ImGui::GetColumnIndex();
-
-	assert(column_index >= 0);
-
-	const auto columnCount = ImGui::GetColumnsCount();
-	for (int i = 0; i < columnCount; i++)
-	{
-		if (i != column_index)
-			contentRegionWidth -= ImGui::GetColumnWidth(i);
-	}
-
-	return contentRegionWidth - 3;//ImGui::GetStyle().ItemSpacing.x;
 }
 
 void MainWindow::OnDrawScoreboardContextMenu(IPlayer& player)
@@ -69,11 +74,30 @@ void MainWindow::OnDrawScoreboardContextMenu(IPlayer& player)
 		if (ImGui::MenuItem("Copy SteamID", nullptr, false, steamID.IsValid()))
 			ImGui::SetClipboardText(steamID.str().c_str());
 
+		if (ImGui::BeginMenu("Go To"))
+		{
+			if (!m_Settings.m_GotoProfileSites.empty())
+			{
+				for (const auto& item : m_Settings.m_GotoProfileSites)
+				{
+					ImGuiDesktop::ScopeGuards::ID id(&item);
+					if (ImGui::MenuItem(item.m_Name.c_str()))
+						Shell::OpenURL(item.CreateProfileURL(player));
+				}
+			}
+			else
+			{
+				ImGui::MenuItem("No sites configured", nullptr, nullptr, false);
+			}
+
+			ImGui::EndMenu();
+		}
+
 		const auto& world = GetWorld();
 		auto& modLogic = GetModLogic();
 
 		if (ImGui::BeginMenu("Votekick",
-			(world.GetTeamShareResult(steamID, m_Settings.m_LocalSteamID) == TeamShareResult::SameTeams) && world.FindUserID(steamID)))
+			(world.GetTeamShareResult(steamID, m_Settings.GetLocalSteamID()) == TeamShareResult::SameTeams) && world.FindUserID(steamID)))
 		{
 			if (ImGui::MenuItem("Cheating"))
 				modLogic.InitiateVotekick(player, KickReason::Cheating);
@@ -100,7 +124,7 @@ void MainWindow::OnDrawScoreboardContextMenu(IPlayer& player)
 				if (ImGui::MenuItem(name.c_str(), nullptr, existingMarked))
 				{
 					if (modLogic.SetPlayerAttribute(player, PlayerAttributes(i), !existingMarked))
-						Log("Manually marked "s << player << (existingMarked ? "NOT " : "") << PlayerAttributes(i));
+						Log("Manually marked "s << player << ' ' << (existingMarked ? "NOT" : "") << ' ' << PlayerAttributes(i));
 				}
 			}
 
@@ -108,14 +132,12 @@ void MainWindow::OnDrawScoreboardContextMenu(IPlayer& player)
 		}
 
 #ifdef _DEBUG
-		if (IsWorldValid())
-		{
-			ImGui::Separator();
+		ImGui::Separator();
 
-			auto& modLogic = GetModLogic();
-			bool isRunning = modLogic.IsUserRunningTool(player);
-			if (ImGui::MenuItem("Is Running TFBD", nullptr, isRunning))
-				modLogic.SetUserRunningTool(player, !isRunning);
+		if (bool isRunning = m_ModeratorLogic.IsUserRunningTool(player);
+			ImGui::MenuItem("Is Running TFBD", nullptr, isRunning))
+		{
+			m_ModeratorLogic.SetUserRunningTool(player, !isRunning);
 		}
 #endif
 	}
@@ -277,18 +299,18 @@ void MainWindow::OnDrawScoreboard()
 				ImGui::Separator();
 			}
 
-			if (m_WorldState)
+			if (m_ConsoleLogParser)
 			{
-				for (IPlayer* playerPtr : m_WorldState->GeneratePlayerPrintData())
+				for (IPlayer& player : m_ConsoleLogParser->GeneratePlayerPrintData())
 				{
-					IPlayer& player = *playerPtr;
+					const auto& playerName = player.GetNameSafe();
 					ImGuiDesktop::ScopeGuards::ID idScope((int)player.GetSteamID().Lower32);
 					ImGuiDesktop::ScopeGuards::ID idScope2((int)player.GetSteamID().Upper32);
 
 					std::optional<ImGuiDesktop::ScopeGuards::StyleColor> textColor;
-					if (player.GetConnectionState() != PlayerStatusState::Active || player.GetName().empty())
+					if (player.GetConnectionState() != PlayerStatusState::Active || player.GetNameSafe().empty())
 						textColor.emplace(ImGuiCol_Text, ImVec4(1, 1, 0, 0.5f));
-					else if (player.GetSteamID() == m_Settings.m_LocalSteamID)
+					else if (player.GetSteamID() == m_Settings.GetLocalSteamID())
 						textColor.emplace(ImGuiCol_Text, m_Settings.m_Theme.m_Colors.m_ScoreboardYou);
 
 					char buf[32];
@@ -306,14 +328,10 @@ void MainWindow::OnDrawScoreboard()
 					{
 						ImVec4 bgColor = [&]() -> ImVec4
 						{
-							if (IsWorldValid())
+							switch (m_ModeratorLogic.GetTeamShareResult(player))
 							{
-								auto& modLogic = GetModLogic();
-								switch (modLogic.GetTeamShareResult(player))
-								{
-								case TeamShareResult::SameTeams:      return m_Settings.m_Theme.m_Colors.m_FriendlyTeam;
-								case TeamShareResult::OppositeTeams:  return m_Settings.m_Theme.m_Colors.m_EnemyTeam;
-								}
+							case TeamShareResult::SameTeams:      return m_Settings.m_Theme.m_Colors.m_FriendlyTeam;
+							case TeamShareResult::OppositeTeams:  return m_Settings.m_Theme.m_Colors.m_EnemyTeam;
 							}
 
 							switch (player.GetTeam())
@@ -342,6 +360,17 @@ void MainWindow::OnDrawScoreboard()
 						bgColor.w = std::min(bgColor.w + 0.5f, 1.0f);
 						ImGuiDesktop::ScopeGuards::StyleColor styleColorScopeActive(ImGuiCol_HeaderActive, bgColor);
 						ImGui::Selectable(buf, true, ImGuiSelectableFlags_SpanAllColumns);
+
+						if (player.GetSteamID() != m_Settings.GetLocalSteamID() && ImGui::IsItemHovered())
+						{
+							ImGui::BeginTooltip();
+							auto kills = player.GetScores().m_LocalKills;
+							auto deaths = player.GetScores().m_LocalDeaths;
+							//ImGui::Text("Your Thirst: %1.0f%%", kills == 0 ? float(deaths) * 100 : float(deaths) / kills * 100);
+							ImGui::Text("Their Thirst: %1.0f%%", deaths == 0 ? float(kills) * 100 : float(kills) / deaths * 100);
+							ImGui::EndTooltip();
+						}
+
 						ImGui::NextColumn();
 					}
 
@@ -349,17 +378,27 @@ void MainWindow::OnDrawScoreboard()
 
 					// player names column
 					{
-						if (player.GetName().empty())
-							ImGui::TextUnformatted("<Unknown>");
+						if (!playerName.empty())
+							ImGui::TextUnformatted(playerName);
+						else if (const SteamAPI::PlayerSummary* summary = player.GetPlayerSummary(); summary && !summary->m_Nickname.empty())
+							ImGui::TextUnformatted(summary->m_Nickname);
 						else
-							ImGui::TextUnformatted(player.GetName());
+							ImGui::TextUnformatted("<Unknown>");
+
+						// If their steamcommunity name doesn't match their ingame name
+						if (auto summary = player.GetPlayerSummary();
+							summary && !playerName.empty() && summary->m_Nickname != playerName)
+						{
+							ImGui::SameLine();
+							ImGui::TextColored({ 1, 0, 0, 1 }, "(%s)", summary->m_Nickname.c_str());
+						}
 
 						ImGui::NextColumn();
 					}
 
 					// Kills column
 					{
-						if (player.GetName().empty())
+						if (playerName.empty())
 							ImGui::TextRightAligned("?");
 						else
 							ImGui::TextRightAlignedF("%u", player.GetScores().m_Kills);
@@ -369,7 +408,7 @@ void MainWindow::OnDrawScoreboard()
 
 					// Deaths column
 					{
-						if (player.GetName().empty())
+						if (playerName.empty())
 							ImGui::TextRightAligned("?");
 						else
 							ImGui::TextRightAlignedF("%u", player.GetScores().m_Deaths);
@@ -379,7 +418,7 @@ void MainWindow::OnDrawScoreboard()
 
 					// Connected time column
 					{
-						if (player.GetName().empty())
+						if (playerName.empty())
 						{
 							ImGui::TextRightAligned("?");
 						}
@@ -395,7 +434,7 @@ void MainWindow::OnDrawScoreboard()
 
 					// Ping column
 					{
-						if (player.GetName().empty())
+						if (playerName.empty())
 							ImGui::TextRightAligned("?");
 						else
 							ImGui::TextRightAlignedF("%u", player.GetPing());
@@ -424,12 +463,12 @@ void MainWindow::OnDrawChat()
 {
 	ImGui::AutoScrollBox("##fileContents", { 0, 0 }, [&]()
 		{
-			if (!IsWorldValid())
+			if (!m_ConsoleLogParser)
 				return;
 
 			ImGui::PushTextWrapPos();
 
-			for (auto it = m_WorldState->m_PrintingLines.rbegin(); it != m_WorldState->m_PrintingLines.rend(); ++it)
+			for (auto it = m_ConsoleLogParser->m_PrintingLines.rbegin(); it != m_ConsoleLogParser->m_PrintingLines.rend(); ++it)
 			{
 				assert(*it);
 				(*it)->Print();
@@ -445,52 +484,29 @@ void MainWindow::OnDrawAppLog()
 		{
 			ImGui::PushTextWrapPos();
 
-			for (const LogMessage* msgPtr : GetLogMsgs())
+			for (const LogMessage& msg : GetVisibleLogMsgs())
 			{
-				const LogMessage& msg = *msgPtr;
 				const std::tm timestamp = ToTM(msg.m_Timestamp);
 
+				ImGuiDesktop::ScopeGuards::ID id(&msg);
+
+				ImGui::BeginGroup();
 				ImGui::TextColored({ 0.25f, 1.0f, 0.25f, 0.25f }, "[%02i:%02i:%02i]",
 					timestamp.tm_hour, timestamp.tm_min, timestamp.tm_sec);
 
 				ImGui::SameLine();
 				ImGui::TextColoredUnformatted({ msg.m_Color.r, msg.m_Color.g, msg.m_Color.b, msg.m_Color.a }, msg.m_Text);
+				ImGui::EndGroup();
+
+				if (auto scope = ImGui::BeginPopupContextItemScope("AppLogContextMenu"))
+				{
+					if (ImGui::MenuItem("Copy"))
+						ImGui::SetClipboardText(msg.m_Text.c_str());
+				}
 			}
 
 			ImGui::PopTextWrapPos();
 		});
-}
-
-void MainWindow::OnDrawNetGraph()
-{
-	auto [startTime, endTime] = GetNetSamplesRange();
-	if ((endTime - startTime) > (NET_GRAPH_DURATION + 10s))
-		PruneNetSamples(startTime, endTime);
-
-	auto delta = GetCurrentTimestampCompensated() - endTime;
-	startTime += delta;
-	endTime += delta;
-
-	ImPlot::SetNextPlotLimitsX(-to_seconds<float>(NET_GRAPH_DURATION), 0, ImGuiCond_Always);
-
-	constexpr int YAXIS_TIME = 0;
-	constexpr int YAXIS_DATA = 1;
-
-	const auto maxLatency = std::max(GetMaxValue(m_NetSamplesIn.m_Latency), GetMaxValue(m_NetSamplesOut.m_Latency));
-	ImPlot::SetNextPlotLimitsY(0 - (maxLatency * 0.025f), maxLatency + (maxLatency * 0.025f), ImGuiCond_Always, YAXIS_TIME);
-
-	const auto maxData = std::max(GetMaxValue(m_NetSamplesIn.m_Data), GetMaxValue(m_NetSamplesOut.m_Data));
-	ImPlot::SetNextPlotLimitsY(0 - (maxData * 0.025f), maxData + (maxData * 0.025f), ImGuiCond_Always, YAXIS_DATA);
-
-	constexpr ImPlotFlags plotFlags = ImPlotFlags_Default | ImPlotFlags_AntiAliased | ImPlotFlags_YAxis2;
-	if (ImPlot::BeginPlot("NetGraph", "Time", nullptr, { -1, 0 }, plotFlags))
-	{
-		//PlotNetSamples("Ping In", m_NetSamplesIn.m_Latency, startTime, endTime, YAXIS_TIME);
-		//PlotNetSamples("Ping Out", m_NetSamplesOut.m_Latency, startTime, endTime, YAXIS_TIME);
-		PlotNetSamples("Data In", m_NetSamplesIn.m_Data, startTime, endTime, YAXIS_DATA);
-		PlotNetSamples("Data Out", m_NetSamplesOut.m_Data, startTime, endTime, YAXIS_DATA);
-		ImPlot::EndPlot();
-	}
 }
 
 void MainWindow::OnDrawSettingsPopup()
@@ -506,34 +522,288 @@ void MainWindow::OnDrawSettingsPopup()
 	}
 
 	ImGui::SetNextWindowSize({ 400, 400 }, ImGuiCond_Once);
-	if (ImGui::BeginPopupModal(POPUP_NAME, &s_Open))
+	if (ImGui::BeginPopupModal(POPUP_NAME, &s_Open, ImGuiWindowFlags_HorizontalScrollbar))
 	{
-		// Local steamid
-		if (InputTextSteamID("My Steam ID", m_Settings.m_LocalSteamID))
+		// Steam dir
+		if (InputTextSteamDirOverride("Steam directory", m_Settings.m_SteamDirOverride, true))
 			m_Settings.SaveFile();
 
-		// TF game dir
-		if (InputTextTFDir("tf directory", m_Settings.m_TFDir))
+		// TF game dir override
+		if (InputTextTFDirOverride("tf directory", m_Settings.m_TFDirOverride, FindTFDir(m_Settings.GetSteamDir()), true))
+			m_Settings.SaveFile();
+
+		// Local steamid
+		if (InputTextSteamIDOverride("My Steam ID", m_Settings.m_LocalSteamIDOverride, true))
 			m_Settings.SaveFile();
 
 		// Sleep when unfocused
 		{
 			if (ImGui::Checkbox("Sleep when unfocused", &m_Settings.m_SleepWhenUnfocused))
 				m_Settings.SaveFile();
-			if (ImGui::IsItemHovered())
-				ImGui::SetTooltip("Slows program refresh rate when not focused to reduce CPU/GPU usage.");
+			ImGui::SetHoverTooltip("Slows program refresh rate when not focused to reduce CPU/GPU usage.");
 		}
+
+		if (AutoLaunchTF2Checkbox(m_Settings.m_AutoLaunchTF2))
+			m_Settings.SaveFile();
 
 		// Auto temp mute
 		{
 			if (ImGui::Checkbox("Auto temp mute", &m_Settings.m_AutoTempMute))
 				m_Settings.SaveFile();
-			if (ImGui::IsItemHovered())
-				ImGui::SetTooltip("Automatically, temporarily mute ingame chat messages if we think someone else in the server is running the tool.");
+			ImGui::SetHoverTooltip("Automatically, temporarily mute ingame chat messages if we think someone else in the server is running the tool.");
+		}
+
+		// Send warnings for connecting cheaters
+		{
+			if (ImGui::Checkbox("Chat message warnings for connecting cheaters", &m_Settings.m_AutoChatWarningsConnecting))
+				m_Settings.SaveFile();
+
+			ImGui::SetHoverTooltip("Automatically sends a chat message if a cheater has joined the lobby,"
+				" but is not yet in the game. Only has an effect if \"Enable Chat Warnings\""
+				" is enabled (upper left of main window).\n"
+				"\n"
+				"Looks like: \"Heads up! There are N known cheaters joining the other team! Names unknown until they fully join.\"");
+		}
+
+		if (bool allowInternet = m_Settings.m_AllowInternetUsage.value_or(false);
+			ImGui::Checkbox("Allow internet connectivity", &allowInternet))
+		{
+			m_Settings.m_AllowInternetUsage = allowInternet;
+			m_Settings.SaveFile();
+		}
+
+		ImGui::EnabledSwitch(m_Settings.m_AllowInternetUsage.value_or(false), [&](bool enabled)
+			{
+				auto mode = enabled ? m_Settings.m_ProgramUpdateCheckMode : ProgramUpdateCheckMode::Disabled;
+
+				if (Combo("Automatic update checking", mode))
+				{
+					m_Settings.m_ProgramUpdateCheckMode = mode;
+					m_Settings.SaveFile();
+				}
+			}, "Requires \"Allow internet connectivity\"");
+
+		ImGui::EndPopup();
+	}
+}
+
+void MainWindow::OnDrawUpdateCheckPopup()
+{
+	static constexpr char POPUP_NAME[] = "Check for Updates##Popup";
+
+	static bool s_Open = false;
+	if (m_UpdateCheckPopupOpen)
+	{
+		m_UpdateCheckPopupOpen = false;
+		ImGui::OpenPopup(POPUP_NAME);
+		s_Open = true;
+	}
+
+	ImGui::SetNextWindowSize({ 500, 300 }, ImGuiCond_Appearing);
+	if (ImGui::BeginPopupModal(POPUP_NAME, &s_Open, ImGuiWindowFlags_AlwaysAutoResize))
+	{
+		ImGui::PushTextWrapPos();
+		ImGui::TextUnformatted("You have chosen to disable internet connectivity for TF2 Bot Detector. You can still manually check for updates below.");
+		ImGui::TextColoredUnformatted({ 1, 1, 0, 1 }, "Reminder: if you use antivirus software, connecting to the internet may trigger warnings.");
+
+		ImGui::EnabledSwitch(!m_UpdateInfo.valid(), [&]
+			{
+				if (ImGui::Button("Check for updates"))
+					GetUpdateInfo();
+			});
+
+		ImGui::NewLine();
+
+		if (mh::is_future_ready(m_UpdateInfo))
+		{
+			auto& updateInfo = m_UpdateInfo.get();
+
+			if (updateInfo.IsUpToDate())
+			{
+				ImGui::TextColoredUnformatted({ 0.1f, 1, 0.1f, 1 }, "You are already running the latest version of TF2 Bot Detector.");
+			}
+			else if (updateInfo.IsPreviewAvailable())
+			{
+				ImGui::TextUnformatted("There is a new preview version available.");
+				if (ImGui::Button("View on Github"))
+					Shell::OpenURL(updateInfo.m_Preview->m_URL);
+			}
+			else if (updateInfo.IsReleaseAvailable())
+			{
+				ImGui::TextUnformatted("There is a new stable version available.");
+				if (ImGui::Button("View on Github"))
+					Shell::OpenURL(updateInfo.m_Stable->m_URL);
+			}
+			else if (updateInfo.IsError())
+			{
+				ImGui::TextColoredUnformatted({ 1, 0, 0, 1 }, "There was an error checking for updates.");
+			}
+		}
+		else if (m_UpdateInfo.valid())
+		{
+			ImGui::TextUnformatted("Checking for updates...");
+		}
+		else
+		{
+			ImGui::TextUnformatted("Press \"Check for updates\" to check Github for a newer version.");
 		}
 
 		ImGui::EndPopup();
 	}
+}
+
+void MainWindow::OpenUpdateCheckPopup()
+{
+	m_NotifyOnUpdateAvailable = false;
+	m_UpdateCheckPopupOpen = true;
+}
+
+void MainWindow::OnDrawUpdateAvailablePopup()
+{
+	static constexpr char POPUP_NAME[] = "Update Available##Popup";
+
+	static bool s_Open = false;
+	if (m_UpdateAvailablePopupOpen)
+	{
+		m_UpdateAvailablePopupOpen = false;
+		ImGui::OpenPopup(POPUP_NAME);
+		s_Open = true;
+	}
+
+	if (ImGui::BeginPopupModal(POPUP_NAME, &s_Open, ImGuiWindowFlags_AlwaysAutoResize))
+	{
+		ImGui::TextUnformatted("There is a new"s << (m_UpdateInfo.get().IsPreviewAvailable() ? " preview" : "")
+			<< " version of TF2 Bot Detector available for download.");
+
+		if (ImGui::Button("View on Github"))
+			Shell::OpenURL(m_UpdateInfo.get().GetURL());
+
+		ImGui::EndPopup();
+	}
+}
+
+void MainWindow::OpenUpdateAvailablePopup()
+{
+	m_NotifyOnUpdateAvailable = false;
+	m_UpdateAvailablePopupOpen = true;
+}
+
+void MainWindow::OnDrawAboutPopup()
+{
+	static constexpr char POPUP_NAME[] = "About##Popup";
+
+	static bool s_Open = false;
+	if (m_AboutPopupOpen)
+	{
+		m_AboutPopupOpen = false;
+		ImGui::OpenPopup(POPUP_NAME);
+		s_Open = true;
+	}
+
+	ImGui::SetNextWindowSize({ 600, 450 }, ImGuiCond_Appearing);
+	if (ImGui::BeginPopupModal(POPUP_NAME, &s_Open))
+	{
+		ImGui::PushTextWrapPos();
+
+		static const std::string ABOUT_TEXT =
+			"TF2 Bot Detector v"s << VERSION << "\n"
+			"\n"
+			"Automatically detects and votekicks cheaters in Team Fortress 2 Casual.\n"
+			"\n"
+			"This program is free, open source software licensed under the MIT license. Full license text"
+			" for this program and its dependencies can be found in the licenses subfolder next to this"
+			" executable.";
+
+		ImGui::TextUnformatted(ABOUT_TEXT);
+
+		ImGui::NewLine();
+		ImGui::Separator();
+		ImGui::NewLine();
+
+		ImGui::TextUnformatted("Credits");
+		ImGui::Spacing();
+		if (ImGui::TreeNode("Code/concept by Matt \"pazer\" Haynie"))
+		{
+			if (ImGui::Selectable("GitHub - PazerOP", false, ImGuiSelectableFlags_DontClosePopups))
+				Shell::OpenURL("https://github.com/PazerOP");
+			if (ImGui::Selectable("Twitter - @PazerFromSilver", false, ImGuiSelectableFlags_DontClosePopups))
+				Shell::OpenURL("https://twitter.com/PazerFromSilver");
+
+			ImGui::TreePop();
+		}
+		if (ImGui::TreeNode("Artwork/icon by S-Purple"))
+		{
+			if (ImGui::Selectable("Twitter (NSFW)", false, ImGuiSelectableFlags_DontClosePopups))
+				Shell::OpenURL("https://twitter.com/spurpleheart");
+
+			ImGui::TreePop();
+		}
+		if (ImGui::TreeNode("Documentation/moderation by Nicholas \"ClusterConsultant\" Flamel"))
+		{
+			if (ImGui::Selectable("GitHub - ClusterConsultant", false, ImGuiSelectableFlags_DontClosePopups))
+				Shell::OpenURL("https://github.com/ClusterConsultant");
+
+			ImGui::TreePop();
+		}
+
+		ImGui::NewLine();
+		ImGui::Separator();
+		ImGui::NewLine();
+
+		if (const auto sponsors = m_SponsorsList.GetSponsors(); !sponsors.empty())
+		{
+			ImGui::TextUnformatted("Sponsors\n"
+				"Huge thanks to the people sponsoring this project via GitHub Sponsors:");
+
+			ImGui::NewLine();
+
+			for (const auto& sponsor : sponsors)
+			{
+				ImGui::Bullet();
+				ImGui::TextUnformatted(sponsor.m_Name);
+				ImGui::SameLine();
+				ImGui::TextUnformatted("-");
+				ImGui::SameLine();
+				ImGui::TextUnformatted(sponsor.m_Message);
+			}
+
+			ImGui::NewLine();
+		}
+
+		ImGui::TextUnformatted("If you're feeling generous, you can make a small donation to help support my work.");
+		if (ImGui::Button("GitHub Sponsors"))
+			Shell::OpenURL("https://github.com/sponsors/PazerOP");
+
+		ImGui::EndPopup();
+	}
+}
+
+#include <libzippp/libzippp.h>
+void MainWindow::GenerateDebugReport()
+{
+	Log("Generating debug_report.zip...");
+	{
+		using namespace libzippp;
+		ZipArchive archive("debug_report.zip");
+		archive.open(ZipArchive::NEW);
+
+		if (!archive.addFile("console.log", (m_Settings.GetTFDir() / "console.log").string()))
+		{
+			LogError("Failed to add console.log to debug report");
+		}
+		if (!archive.addFile("tf2bd.log", GetLogFilename().string()))
+		{
+			LogError("Failed to add tf2bd log to debug report");
+		}
+
+		if (auto err = archive.close(); err != LIBZIPPP_OK)
+		{
+			LogError("Failed to close debug report zip archive: close() returned "s << err);
+			return;
+		}
+	}
+	Log("Finished generating debug_report.zip.");
+	Shell::ExploreToAndSelect("debug_report.zip");
 }
 
 void MainWindow::OnDrawServerStats()
@@ -553,8 +823,7 @@ void MainWindow::OnDrawServerStats()
 		sprintf_s(buf, "%i (%1.0f%%)", lastSample.m_UsedEdicts, percent * 100);
 		ImGui::ProgressBar(percent, { -1, 0 }, buf);
 
-		if (ImGui::IsItemHovered())
-			ImGui::SetTooltip("%i of %i (%1.1f%%)", lastSample.m_UsedEdicts, lastSample.m_MaxEdicts, percent * 100);
+		ImGui::SetHoverTooltip("%i of %i (%1.1f%%)", lastSample.m_UsedEdicts, lastSample.m_MaxEdicts, percent * 100);
 	}
 
 	if (!m_ServerPingSamples.empty())
@@ -572,39 +841,87 @@ void MainWindow::OnDrawServerStats()
 
 void MainWindow::OnDraw()
 {
-	if (m_SetupFlow.OnDraw(m_Settings))
-		return;
+	OnDrawSettingsPopup();
+	OnDrawUpdateAvailablePopup();
+	OnDrawUpdateCheckPopup();
+	OnDrawAboutPopup();
+
+	{
+		ISetupFlowPage::DrawState ds;
+		ds.m_ActionManager = &m_ActionManager;
+		ds.m_Settings = &m_Settings;
+
+		if (m_SetupFlow.OnDraw(m_Settings, ds))
+			return;
+	}
 
 	ImGui::Columns(2, "MainWindowSplit");
 
-	ImGui::Checkbox("Pause", &m_Paused); ImGui::SameLine();
+	{
+		static float s_SettingsScrollerHeight = 1;
+		if (ImGui::BeginChild("SettingsScroller", { 0, s_SettingsScrollerHeight }, false, ImGuiWindowFlags_HorizontalScrollbar))
+		{
+			ImGui::Checkbox("Pause", &m_Paused); ImGui::SameLine();
 
-	ImGui::Checkbox("Mute", &m_Settings.m_Unsaved.m_Muted); ImGui::SameLine();
-	if (ImGui::IsItemHovered())
-		ImGui::SetTooltip("Suppresses all in-game chat messages.");
+			auto& settings = m_Settings;
+			const auto ModerationCheckbox = [&settings](const char* name, bool& value, const char* tooltip)
+			{
+				{
+					ImGuiDesktop::ScopeGuards::TextColor text({ 1, 0.5f, 0, 1 }, !value);
+					if (ImGui::Checkbox(name, &value))
+						settings.SaveFile();
+				}
 
-	ImGui::Checkbox("Show Commands", &m_Settings.m_Unsaved.m_DebugShowCommands);
-	if (ImGui::IsItemHovered())
-		ImGui::SetTooltip("Prints out all game commands to the log.");
+				const char* orangeReason = "";
+				if (!value)
+					orangeReason = "\n\nThis label is orange to highlight the fact that it is currently disabled.";
+
+				ImGui::SameLine();
+				ImGui::SetHoverTooltip("%s%s", tooltip, orangeReason);
+			};
+
+			ModerationCheckbox("Enable Chat Warnings", m_Settings.m_AutoChatWarnings, "Enables chat message warnings about cheaters.");
+			ModerationCheckbox("Enable Auto Votekick", m_Settings.m_AutoVotekick, "Automatically votekicks cheaters on your team.");
+			ModerationCheckbox("Enable Auto-mark", m_Settings.m_AutoMark, "Automatically marks players matching the detection rules.");
+
+			ImGui::Checkbox("Show Commands", &m_Settings.m_Unsaved.m_DebugShowCommands); ImGui::SameLine();
+			ImGui::SetHoverTooltip("Prints out all game commands to the log.");
+
+			const auto xPos = ImGui::GetCursorPosX();
+
+			ImGui::NewLine();
+
+			s_SettingsScrollerHeight = ImGui::GetCursorPosY();
+			if (ImGui::GetWindowSize().x < xPos)
+				s_SettingsScrollerHeight += ImGui::GetStyle().ScrollbarSize;
+		}
+		ImGui::EndChild();
+	}
 
 	ImGui::Value("Time (Compensated)", to_seconds<float>(GetCurrentTimestampCompensated() - m_OpenTime));
 
 #ifdef _DEBUG
-	if (IsWorldValid())
 	{
-		auto& modLogic = GetModLogic();
-		auto leader = modLogic.GetBotLeader();
+		auto leader = m_ModeratorLogic.GetBotLeader();
 		ImGui::Value("Bot Leader", leader ? (""s << *leader).c_str() : "");
-		ImGui::Value("Time to next connecting cheater warning", to_seconds(modLogic.TimeToConnectingCheaterWarning()));
-		ImGui::Value("Time to next cheater warning", to_seconds(modLogic.TimeToCheaterWarning()));
+
+		ImGui::TextUnformatted("Is vote in progress:");
+		ImGui::SameLine();
+		if (m_WorldState.IsVoteInProgress())
+			ImGui::TextColoredUnformatted({ 1, 1, 0, 1 }, "YES");
+		else
+			ImGui::TextColoredUnformatted({ 0, 1, 0, 1 }, "NO");
 	}
 #endif
 
-	if (IsWorldValid())
+	ImGui::Value("Blackslisted user count", m_ModeratorLogic.GetBlacklistedPlayerCount());
+	ImGui::Value("Rule count", m_ModeratorLogic.GetRuleCount());
+
+	if (m_ConsoleLogParser)
 	{
 		auto& world = GetWorld();
-		const auto parsedLineCount = world.GetParsedLineCount();
-		const auto parseProgress = world.GetParseProgress();
+		const auto parsedLineCount = m_ConsoleLogParser->m_Parser.GetParsedLineCount();
+		const auto parseProgress = m_ConsoleLogParser->m_Parser.GetParseProgress();
 
 		if (parseProgress < 0.95f)
 		{
@@ -625,25 +942,40 @@ void MainWindow::OnDraw()
 	OnDrawScoreboard();
 	OnDrawAppLog();
 	ImGui::NextColumn();
-
-	OnDrawSettingsPopup();
 }
 
 void MainWindow::OnDrawMenuBar()
 {
-	if (m_SetupFlow.ShouldDraw())
-		return;
+	const bool isInSetupFlow = m_SetupFlow.ShouldDraw();
 
-#if 0
 	if (ImGui::BeginMenu("File"))
 	{
+		if (!isInSetupFlow)
+		{
+			if (ImGui::MenuItem("Reload Playerlists/Rules"))
+				GetModLogic().ReloadConfigFiles();
+			if (ImGui::MenuItem("Reload Settings"))
+				m_Settings.LoadFile();
+			if (ImGui::MenuItem("Generate Debug Report"))
+				GenerateDebugReport();
+
+			ImGui::Separator();
+		}
+
+		if (ImGui::MenuItem("Exit", "Alt+F4"))
+			SetShouldClose(true);
+
 		ImGui::EndMenu();
 	}
-#endif
 
 #ifdef _DEBUG
 	if (ImGui::BeginMenu("Debug"))
 	{
+		if (ImGui::MenuItem("Reload Localization Files"))
+			m_ActionManager.QueueAction<GenericCommandAction>("cl_reload_localization_files");
+
+		ImGui::Separator();
+
 		if (ImGui::MenuItem("Crash"))
 		{
 			struct Test
@@ -659,13 +991,11 @@ void MainWindow::OnDrawMenuBar()
 
 #ifdef _DEBUG
 	static bool s_ImGuiDemoWindow = false;
-	static bool s_ImPlotDemoWindow = false;
 #endif
 	if (ImGui::BeginMenu("Window"))
 	{
 #ifdef _DEBUG
 		ImGui::MenuItem("ImGui Demo Window", nullptr, &s_ImGuiDemoWindow);
-		ImGui::MenuItem("ImPlot Demo Window", nullptr, &s_ImPlotDemoWindow);
 #endif
 		ImGui::EndMenu();
 	}
@@ -673,48 +1003,142 @@ void MainWindow::OnDrawMenuBar()
 #ifdef _DEBUG
 	if (s_ImGuiDemoWindow)
 		ImGui::ShowDemoWindow(&s_ImGuiDemoWindow);
-	if (s_ImPlotDemoWindow)
-		ImPlot::ShowDemoWindow(&s_ImPlotDemoWindow);
 #endif
 #endif
 
-	if (ImGui::MenuItem("Settings"))
-		OpenSettingsPopup();
+	if (!isInSetupFlow)
+	{
+		if (ImGui::MenuItem("Settings"))
+			OpenSettingsPopup();
+	}
+
+	if (ImGui::BeginMenu("Help"))
+	{
+		if (ImGui::MenuItem("Open GitHub"))
+			Shell::OpenURL("https://github.com/PazerOP/tf2_bot_detector");
+		if (ImGui::MenuItem("Open Discord"))
+			Shell::OpenURL("https://discord.gg/W8ZSh3Z");
+
+		ImGui::Separator();
+
+		char buf[128];
+		sprintf_s(buf, "Version: %s", VERSION_STRING);
+		ImGui::MenuItem(buf, nullptr, false, false);
+
+		if (m_Settings.m_AllowInternetUsage.value_or(false))
+		{
+			auto newVersion = GetUpdateInfo();
+			if (!newVersion)
+			{
+				ImGui::MenuItem("Checking for new version...", nullptr, nullptr, false);
+			}
+			else if (newVersion->IsUpToDate())
+			{
+				ImGui::MenuItem("Up to date!", nullptr, nullptr, false);
+			}
+			else if (newVersion->IsReleaseAvailable())
+			{
+				ImGuiDesktop::ScopeGuards::TextColor green({ 0, 1, 0, 1 });
+				if (ImGui::MenuItem("A new version is available"))
+					Shell::OpenURL(newVersion->m_Stable->m_URL);
+			}
+			else if (newVersion->IsPreviewAvailable())
+			{
+				if (ImGui::MenuItem("A new preview is available"))
+					Shell::OpenURL(newVersion->m_Preview->m_URL);
+			}
+			else
+			{
+				assert(newVersion->IsError());
+				ImGui::MenuItem("Error occurred checking for new version.", nullptr, nullptr, false);
+			}
+		}
+		else
+		{
+			if (ImGui::MenuItem("Check for updates..."))
+				OpenUpdateCheckPopup();
+		}
+
+		ImGui::Separator();
+
+		if (ImGui::MenuItem("About TF2 Bot Detector"))
+			OpenAboutPopup();
+
+		ImGui::EndMenu();
+	}
 }
 
-bool MainWindow::HasMenuBar() const
+GithubAPI::NewVersionResult* MainWindow::GetUpdateInfo()
 {
-	if (m_SetupFlow.ShouldDraw())
-		return false;
+	if (!m_UpdateInfo.valid())
+	{
+		if (auto client = m_Settings.GetHTTPClient())
+			m_UpdateInfo = GithubAPI::CheckForNewVersion(*client);
+		else
+			return nullptr;
+	}
 
-	return true;
+	if (mh::is_future_ready(m_UpdateInfo))
+		return const_cast<GithubAPI::NewVersionResult*>(&m_UpdateInfo.get());
+
+	return nullptr;
+}
+
+void MainWindow::HandleUpdateCheck()
+{
+	if (!m_NotifyOnUpdateAvailable)
+		return;
+
+	if (!m_Settings.m_AllowInternetUsage.value_or(false))
+		return;
+
+	const bool checkPreviews = m_Settings.m_ProgramUpdateCheckMode == ProgramUpdateCheckMode::Previews;
+	const bool checkReleases = checkPreviews || m_Settings.m_ProgramUpdateCheckMode == ProgramUpdateCheckMode::Releases;
+	if (!checkPreviews && !checkReleases)
+		return;
+
+	auto result = GetUpdateInfo();
+	if (!result)
+		return;
+
+	if ((result->IsPreviewAvailable() && checkPreviews) ||
+		(result->IsReleaseAvailable() && checkReleases))
+	{
+		OpenUpdateAvailablePopup();
+	}
 }
 
 void MainWindow::OnUpdate()
 {
+	if (m_Paused)
+		return;
+
+#ifdef _WIN32
+	m_HijackActionManager.Update();
+#endif
+
+	m_WorldState.Update();
+	m_ActionManager.Update();
+
+	HandleUpdateCheck();
+
 	if (m_SetupFlow.OnUpdate(m_Settings))
 	{
-		m_WorldState.reset();
+		m_ConsoleLogParser.reset();
 		return;
 	}
-	else if (!m_WorldState)
+	else if (!m_ConsoleLogParser)
 	{
-		m_WorldState.emplace(*this, m_Settings, m_Settings.m_TFDir / "console.log");
+		m_ConsoleLogParser.emplace(*this);
 	}
-
-	if (!m_Paused && m_WorldState.has_value())
+	else if (m_ConsoleLogParser)
 	{
-		GetWorld().Update();
-		m_ActionManager.Update();
+		m_ConsoleLogParser->m_Parser.Update();
+		m_ModeratorLogic.Update();
 	}
 }
 
-void MainWindow::OnTimestampUpdate(WorldState& world)
-{
-	SetLogTimestamp(world.GetCurrentTime());
-}
-
-void MainWindow::OnUpdate(WorldState& world, bool consoleLinesUpdated)
+void MainWindow::OnConsoleLogChunkParsed(WorldState& world, bool consoleLinesUpdated)
 {
 	assert(&world == &GetWorld());
 
@@ -744,13 +1168,13 @@ float MainWindow::TimeSine(float interval, float min, float max) const
 
 void MainWindow::OnConsoleLineParsed(WorldState& world, IConsoleLine& parsed)
 {
-	if (parsed.ShouldPrint() && m_WorldState)
+	if (parsed.ShouldPrint() && m_ConsoleLogParser)
 	{
-		auto& ws = *m_WorldState;
-		while (ws.m_PrintingLines.size() > ws.MAX_PRINTING_LINES)
-			ws.m_PrintingLines.pop_back();
+		auto& parser = *m_ConsoleLogParser;
+		while (parser.m_PrintingLines.size() > parser.MAX_PRINTING_LINES)
+			parser.m_PrintingLines.pop_back();
 
-		ws.m_PrintingLines.insert(ws.m_PrintingLines.begin(), &parsed);
+		parser.m_PrintingLines.push_front(parsed.shared_from_this());
 	}
 
 	switch (parsed.GetType())
@@ -778,37 +1202,40 @@ void MainWindow::OnConsoleLineParsed(WorldState& world, IConsoleLine& parsed)
 	}
 }
 
-mh::generator<IPlayer*> MainWindow::WorldStateExtra::GeneratePlayerPrintData()
+MainWindow::ConsoleLogParserExtra::ConsoleLogParserExtra(MainWindow& parent) :
+	m_Parent(&parent),
+	m_Parser(parent.m_WorldState, parent.m_Settings, parent.m_Settings.GetTFDir() / "console.log")
+{
+}
+
+cppcoro::generator<IPlayer&> MainWindow::ConsoleLogParserExtra::GeneratePlayerPrintData()
 {
 	IPlayer* printData[33]{};
 	auto begin = std::begin(printData);
 	auto end = std::end(printData);
 	assert(begin <= end);
-	auto& world = m_WorldState;
+	auto& world = m_Parent->m_WorldState;
 	assert(static_cast<size_t>(end - begin) >= world.GetApproxLobbyMemberCount());
 
 	std::fill(begin, end, nullptr);
 
 	{
 		auto* current = begin;
-		for (IPlayer* member : world.GetLobbyMembers())
+		for (IPlayer& member : world.GetLobbyMembers())
 		{
-			assert(member);
-			*current = member;
-			if (*current)
-				current++;
+			*current = &member;
+			current++;
 		}
 
 		if (current == begin)
 		{
 			// We seem to have either an empty lobby or we're playing on a community server.
 			// Just find the most recent status updates.
-			for (IPlayer* playerData : world.GetPlayers())
+			for (IPlayer& playerData : world.GetPlayers())
 			{
-				assert(playerData);
-				if (playerData->GetLastStatusUpdateTime() >= (m_LastStatusUpdateTime - 15s))
+				if (playerData.GetLastStatusUpdateTime() >= (m_Parent->GetWorld().GetLastStatusUpdateTime() - 15s))
 				{
-					*current = playerData;
+					*current = &playerData;
 					current++;
 
 					if (current >= end)
@@ -820,7 +1247,7 @@ mh::generator<IPlayer*> MainWindow::WorldStateExtra::GeneratePlayerPrintData()
 		end = current;
 	}
 
-	std::sort(begin, end, [](const IPlayer* lhs, const IPlayer* rhs)
+	std::sort(begin, end, [](const IPlayer* lhs, const IPlayer* rhs) -> bool
 		{
 			assert(lhs);
 			assert(rhs);
@@ -851,7 +1278,7 @@ mh::generator<IPlayer*> MainWindow::WorldStateExtra::GeneratePlayerPrintData()
 		});
 
 	for (auto it = begin; it != end; ++it)
-		co_yield *it;
+		co_yield **it;
 }
 
 void MainWindow::UpdateServerPing(time_point_t timestamp)
@@ -862,12 +1289,12 @@ void MainWindow::UpdateServerPing(time_point_t timestamp)
 	float totalPing = 0;
 	uint16_t samples = 0;
 
-	for (IPlayer* player : GetWorld().GetPlayers())
+	for (IPlayer& player : GetWorld().GetPlayers())
 	{
-		if (player->GetLastStatusUpdateTime() < (timestamp - 20s))
+		if (player.GetLastStatusUpdateTime() < (timestamp - 20s))
 			continue;
 
-		auto& data = player->GetOrCreateData<PlayerExtraData>(*player);
+		auto& data = player.GetOrCreateData<PlayerExtraData>(player);
 		totalPing += data.GetAveragePing();
 		samples++;
 	}
@@ -879,100 +1306,9 @@ void MainWindow::UpdateServerPing(time_point_t timestamp)
 		m_ServerPingSamples.erase(m_ServerPingSamples.begin());
 }
 
-std::pair<time_point_t, time_point_t> MainWindow::GetNetSamplesRange() const
+time_point_t MainWindow::GetLastStatusUpdateTime() const
 {
-	time_point_t minTime = time_point_t::max();
-	time_point_t maxTime = time_point_t::min();
-	bool nonEmpty = false;
-
-	const auto Check = [&](const std::map<time_point_t, AvgSample>& data)
-	{
-		if (data.empty())
-			return;
-
-		minTime = std::min(minTime, data.begin()->first);
-		maxTime = std::max(maxTime, std::prev(data.end())->first);
-		nonEmpty = true;
-	};
-
-	Check(m_NetSamplesIn.m_Latency);
-	Check(m_NetSamplesIn.m_Loss);
-	Check(m_NetSamplesIn.m_Packets);
-	Check(m_NetSamplesIn.m_Data);
-
-	Check(m_NetSamplesOut.m_Latency);
-	Check(m_NetSamplesOut.m_Loss);
-	Check(m_NetSamplesOut.m_Packets);
-	Check(m_NetSamplesOut.m_Data);
-
-	return { minTime, maxTime };
-}
-
-void MainWindow::PruneNetSamples(time_point_t& startTime, time_point_t& endTime)
-{
-	const auto Prune = [&](std::map<time_point_t, AvgSample>& data)
-	{
-		auto lower = data.lower_bound(endTime - NET_GRAPH_DURATION);
-		if (lower == data.begin())
-			return;
-
-		data.erase(data.begin(), std::prev(lower));
-	};
-
-	Prune(m_NetSamplesIn.m_Latency);
-	Prune(m_NetSamplesIn.m_Loss);
-	Prune(m_NetSamplesIn.m_Packets);
-	Prune(m_NetSamplesIn.m_Data);
-
-	Prune(m_NetSamplesOut.m_Latency);
-	Prune(m_NetSamplesOut.m_Loss);
-	Prune(m_NetSamplesOut.m_Packets);
-	Prune(m_NetSamplesOut.m_Data);
-
-	const auto newRange = GetNetSamplesRange();
-	startTime = newRange.first;
-	endTime = newRange.second;
-}
-
-void MainWindow::PlotNetSamples(const char* label_id, const std::map<time_point_t, AvgSample>& data,
-	time_point_t startTime, time_point_t endTime, int yAxis) const
-{
-	if (data.empty() || startTime == endTime)
-		return;
-
-	const auto count = data.size();
-	ImVec2* points = reinterpret_cast<ImVec2*>(_malloca(sizeof(ImVec2) * data.size()));
-	if (!points)
-		throw std::runtime_error("Failed to allocate memory for points");
-
-	{
-		const auto startX = ImPlot::GetPlotLimits().X.Min;
-		const auto dataStartTime = data.begin()->first;
-		const auto dataEndTime = std::prev(data.end())->first;
-		const auto startOffset = (startTime - endTime) + (dataStartTime - startTime);
-		const float startOffsetFloat = to_seconds<float>(startOffset);
-		size_t i = 0;
-
-		for (const auto& entry : data)
-		{
-			points[i].x = startOffsetFloat + to_seconds<float>(entry.first - dataStartTime);
-			points[i].y = entry.second.m_AvgValue;
-			i++;
-		}
-	}
-
-	ImPlot::SetPlotYAxis(yAxis);
-	ImPlot::PlotLine(label_id, points, (int)data.size());
-	_freea(points);
-}
-
-float MainWindow::GetMaxValue(const std::map<time_point_t, AvgSample>& data)
-{
-	float max = FLT_MIN;
-	for (const auto& pair : data)
-		max = std::max(max, pair.second.m_AvgValue);
-
-	return max;
+	return GetWorld().GetLastStatusUpdateTime();
 }
 
 float MainWindow::PlayerExtraData::GetAveragePing() const
@@ -992,32 +1328,7 @@ float MainWindow::PlayerExtraData::GetAveragePing() const
 #endif
 }
 
-void MainWindow::AvgSample::AddSample(float value)
-{
-#if 0
-	float delta = m_SampleCount / float(m_SampleCount + 1);
-	m_AvgValue = mh::lerp(m_SampleCount / float(m_SampleCount + 1), value, m_AvgValue);
-	m_SampleCount++;
-#else
-	auto old = m_AvgValue;
-	m_AvgValue = ((m_AvgValue * m_SampleCount) + value) / (m_SampleCount + 1);
-	m_SampleCount++;
-#endif
-}
-
-MainWindow::WorldStateExtra::WorldStateExtra(MainWindow& window,
-	const Settings& settings, const std::filesystem::path& conLogFile) :
-	m_WorldState(conLogFile),
-	m_ModeratorLogic(m_WorldState, settings, window.m_ActionManager)
-{
-	m_WorldState.AddConsoleLineListener(&window);
-	m_WorldState.AddWorldEventListener(&window);
-}
-
 time_point_t MainWindow::GetCurrentTimestampCompensated() const
 {
-	if (IsWorldValid())
-		return m_WorldState->m_WorldState.GetCurrentTime();
-	else
-		return m_OpenTime;
+	return m_WorldState.GetCurrentTime();
 }
